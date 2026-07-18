@@ -570,6 +570,16 @@ tr:hover td{background:rgba(111,76,255,.06)}
 .tile .val{font:900 1.5rem/1.2 Roboto,system-ui,sans-serif;color:#fff;margin:.15rem 0}
 .tile .d{font-size:.8rem}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1rem}
+/* Cards here are narrow and the labels are urls, so the table has to take its width from the card
+   and not from its content, or a long url sets the minimum width and pushes the count column outside
+   the card. table-layout:fixed does that, and it is also what lets the ellipsis already on td.lbl
+   apply, since max-width on a cell is ignored under the default auto layout.
+   Widths are proportional rather than pinned so long headings never clip, and .v only has its cap
+   relaxed, keeping the inline-block and baseline the other cards are aligned to. */
+.grid2 table{table-layout:fixed}
+.grid2 th:first-child,.grid2 td.lbl{width:72%}
+.grid2 td.lbl{max-width:none}
+.grid2 .v{max-width:100%}
 details.x{border-bottom:1px solid rgba(255,255,255,.06)}
 details.x>summary{cursor:pointer;list-style:none;display:grid;grid-template-columns:1fr 66px 70px 62px 62px 92px 64px;gap:.4rem;padding:.45rem .3rem;align-items:center}
 details.x>summary::-webkit-details-marker{display:none}
@@ -905,19 +915,23 @@ def overview_view(w):
         for k, b in it:
             val = dlink(k) if link else "<span class=v>%s</span>" % esc(k)
             h = b["hits"] if isinstance(b, dict) and "hits" in b else b
-            r += "<tr><td class=lbl>%s</td><td>%s</td></tr>" % (val, h)
+            # title carries the untruncated value, since these cards ellipsis long urls to fit.
+            r += "<tr><td class=lbl title=\"%s\">%s</td><td>%s</td></tr>" % (esc(k), val, h)
         return r
     pages = top5(S["flat"]["requests"], link=True)
     refs = ""
     for k, e in sorted(S["xref"].items(), key=lambda kv: kv[1]["b"]["hits"], reverse=True)[:5]:
-        refs += "<tr><td class=lbl><span class=v>%s</span></td><td>%s</td></tr>" % (esc(k), e["b"]["hits"])
+        refs += "<tr><td class=lbl title=\"%s\"><span class=v>%s</span></td><td>%s</td></tr>" % (
+            esc(k), esc(k), e["b"]["hits"])
     errs = ""
     for u, e in sorted(S["err"].items(), key=lambda kv: kv[1]["total"], reverse=True)[:5]:
-        errs += "<tr><td class=lbl>%s</td><td class=bad>%s</td></tr>" % (dlink(u), e["total"])
+        errs += "<tr><td class=lbl title=\"%s\">%s</td><td class=bad>%s</td></tr>" % (
+            esc(u), dlink(u), e["total"])
     ctry = top5(S["flat"]["geo"])
     entries = ""
     for u, e in sorted(SESS[w]["entry"].items(), key=lambda kv: kv[1]["n"], reverse=True)[:5]:
-        entries += "<tr><td class=lbl>%s</td><td>%s</td></tr>" % (dlink(u), e["n"])
+        entries += "<tr><td class=lbl title=\"%s\">%s</td><td>%s</td></tr>" % (
+            esc(u), dlink(u), e["n"])
     lists = ("<div class=grid2>"
              + mini("Top Pages", "requests.html", "<th>URL</th><th>Hits</th>", pages)
              + mini("Top Referrers", "referrers.html", "<th>Referrer</th><th>Hits</th>", refs)
