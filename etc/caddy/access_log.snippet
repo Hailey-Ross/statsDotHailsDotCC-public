@@ -1,0 +1,14 @@
+# Reference fragment for /etc/caddy/Caddyfile (the shared Caddyfile that fronts every site).
+# Place this snippet definition near the top of the Caddyfile (after the global options block),
+# then add the line `import access_log` inside EVERY site block you want logged.
+# This produces the single combined JSON access log that GoAccess reads.
+
+(access_log) {
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 100MiB
+			roll_keep 10
+		}
+		format json
+	}
+}

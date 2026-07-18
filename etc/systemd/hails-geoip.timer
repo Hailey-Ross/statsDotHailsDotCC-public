@@ -1,0 +1,10 @@
+[Unit]
+Description=Monthly DB-IP GeoIP refresh for the stats dashboard
+
+[Timer]
+# The 3rd of each month, after DB-IP has published the new month's free databases.
+OnCalendar=*-*-03 04:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

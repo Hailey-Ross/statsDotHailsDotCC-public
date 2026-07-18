@@ -1,0 +1,57 @@
+# Reference fragment, NOT deployed by deploy.sh.
+#
+# LinkStack has nothing to do with this analytics pipeline. It is here because the Performance page
+# reads container health straight out of docker ps, and the stock LinkStack image gets that wrong in
+# a way that makes the report worse than useless.
+#
+# The image ships this healthcheck:
+#
+#     curl -f http://localhost -A "HealthCheck"
+#
+# LinkStack routes by virtual host, so a request arriving as Host: localhost matches no configured
+# site and comes back 404. The check fails the moment the container starts and never recovers. One
+# container was observed with a failing streak of 2252, exactly its uptime, while the site itself
+# had been serving 200 the whole time.
+#
+# That matters here because your service table then sits permanently at "running, unhealthy". A red
+# row that is always red is worse than no row at all: it teaches you to ignore the one place a real
+# outage would show up.
+#
+# The healthcheck below sends the configured hostname instead. The doubled dollar sign is escaped so
+# compose passes a literal one through and the container's own shell expands it, which keeps the
+# check correct if you ever change HTTP_SERVER_NAME.
+#
+# Applying it recreates the container, so expect a few seconds of downtime. The named volume is not
+# touched, so the data survives:
+#
+#     cp docker-compose.yml docker-compose.yml.bak
+#     # edit the file, then
+#     docker compose config >/dev/null && docker compose up -d
+#     docker inspect linkstack --format '{{.State.Health.Status}}'
+#
+# If you run LinkStack elsewhere, the healthcheck block is the only part worth copying.
+services:
+  linkstack:
+    image: linkstackorg/linkstack:latest
+    container_name: linkstack
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9080:80"
+    environment:
+      TZ: Etc/UTC
+      SERVER_ADMIN: admin@example.com
+      HTTP_SERVER_NAME: links.example.com
+      LOG_LEVEL: info
+    # The image ships "curl -f http://localhost", but LinkStack routes by virtual host, so a request
+    # arriving as Host: localhost matches no configured site and returns 404. The check therefore
+    # reports unhealthy forever while the site serves fine. Send the configured hostname instead.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -s -o /dev/null -H \"Host: $$HTTP_SERVER_NAME\" http://localhost -A HealthCheck || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    volumes:
+      - linkstack_data:/htdocs
+volumes:
+  linkstack_data:

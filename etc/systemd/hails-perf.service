@@ -1,0 +1,31 @@
+[Unit]
+Description=VPS performance collector (samples /proc for the Performance page)
+After=network.target
+
+[Service]
+# Machine specific settings, see config.example.env. The leading dash means a missing file is
+# not an error, so the defaults apply on a fresh install.
+EnvironmentFile=-/etc/hails-stats/config.env
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/hails-perf-collect.py
+Restart=always
+RestartSec=10
+# Resident, not timer driven: the page needs 10 second resolution, and respawning a process 8640
+# times a day would cost more than simply staying alive.
+#
+# Runs as root: it reads systemctl unit state and talks to the docker socket. It opens no listening
+# socket of its own and only ever writes /var/lib/hails-stats.
+#
+# The collector must never compete with the services it measures, so it is niced, its IO is idle
+# class, and MemoryMax kills it rather than letting a leak push anything on this box into swap.
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=20
+MemoryMax=64M
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+
+[Install]
+WantedBy=multi-user.target

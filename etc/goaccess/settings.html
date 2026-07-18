@@ -1,0 +1,153 @@
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>hails analytics settings</title>
+<link rel="icon" type="image/x-icon" href="data:image/x-icon;base64,AAABAAEAEBAQAAEABAAoAQAAFgAAACgAAAAQAAAAIAAAAAEABAAAAAAAgAAAAAAAAAAAAAAAEAAAAAAAAADGxsYAWFhYABwcHABfAP8A/9dfAADXrwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIiIiIiIiIiIjMlUkQgAiIiIiIiIiIiIiIzJVJEIAAAIiIiIiIiIiIiMyVSRCAAIiIiIiIiIiIiIRERERERERERERERERERERIiIiIiIiIiIgACVVUiIiIiIiIiIiIiIiIAAlVVIiIiIiIiIiIiIiIhEREREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA">
+<!-- Settings page for the dashboard, served at /settings.html and linked from the top bar gear.
+     Sets GoAccess view preferences by writing the localStorage AppPrefs key, which every report
+     reads on load. -->
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700;900&display=swap');
+*{box-sizing:border-box}
+body{font-family:'Roboto',system-ui,sans-serif;min-height:100vh;margin:0;padding:3.5rem 1.2rem;color:#e8e8f0;background:radial-gradient(1100px 600px at 50% -10%,rgba(111,76,255,.16),transparent 60%),radial-gradient(900px 500px at 88% 6%,rgba(1,110,218,.12),transparent 55%),radial-gradient(800px 480px at 10% 16%,rgba(217,0,192,.08),transparent 55%),#04050c}
+.wrap{max-width:620px;margin:0 auto}
+a{color:#0085ff;text-decoration:none}
+.back{display:inline-block;margin-bottom:1.4rem;color:rgba(255,255,255,.6);font-size:.9rem}
+h1{font-weight:900;font-size:1.8rem;margin:0 0 .3rem}
+.sub{color:rgba(255,255,255,.55);margin:0 0 2rem;font-size:.92rem}
+.card{background:rgba(13,14,33,.55);border:1px solid rgba(255,255,255,.09);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.45);padding:1.4rem 1.5rem;margin:0 0 1.4rem}
+.card h2{font-weight:700;font-size:.78rem;letter-spacing:.09em;text-transform:uppercase;color:rgba(255,255,255,.5);margin:0 0 1.1rem}
+.line{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:.7rem 0;border-bottom:1px solid rgba(255,255,255,.06)}
+.line:last-child{border-bottom:none}
+.line label{font-size:.98rem;color:#e8e8f0}
+.hint{display:block;font-size:.76rem;color:rgba(255,255,255,.4);margin-top:.15rem}
+select,input[type=text],input[type=number],input[type=password]{background:rgba(13,14,33,.8);color:#e8e8f0;border:1px solid rgba(255,255,255,.16);border-radius:999px;padding:7px 14px;font:500 14px Roboto,system-ui,sans-serif;min-width:150px;outline:none}
+input::placeholder{color:rgba(255,255,255,.35)}
+input[type=number]{min-width:90px;text-align:right}
+.sw{position:relative;width:46px;height:26px;flex:0 0 auto}
+.sw input{opacity:0;width:0;height:0}
+.sw span{position:absolute;inset:0;background:rgba(255,255,255,.14);border-radius:999px;transition:.25s;cursor:pointer}
+.sw span:before{content:'';position:absolute;width:20px;height:20px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.25s}
+.sw input:checked+span{background:linear-gradient(90deg,#016eda,#d900c0)}
+.sw input:checked+span:before{transform:translateX(20px)}
+.actions{display:flex;gap:.8rem;flex-wrap:wrap;align-items:center;margin-top:.4rem}
+button{font:600 14px Roboto,system-ui,sans-serif;padding:10px 22px;border-radius:999px;border:1.5px solid transparent;cursor:pointer;transition:box-shadow .25s,transform .25s,opacity .25s}
+.save{color:#fff;background:linear-gradient(rgba(13,14,33,.4),rgba(13,14,33,.4)) padding-box,radial-gradient(circle at left top,#016eda,#d900c0) border-box}
+.save:hover{box-shadow:0 0 22px rgba(111,76,255,.42);transform:translateY(-1px)}
+.reset{color:#e8e8f0;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14)}
+.reset:hover{background:rgba(217,0,192,.18)}
+.toast{opacity:0;transition:opacity .3s;color:#8fffca;font-size:.9rem}
+.toast.show{opacity:1}
+.note{font-size:.84rem;color:rgba(255,255,255,.48);line-height:1.55;margin:0}
+</style>
+<div class=wrap>
+<a class=back href="/">&#8592; back to dashboard</a>
+<h1>Settings</h1>
+<p class=sub>View preferences for every report. Saved in this browser and applied when a report loads.</p>
+
+<div class=card>
+<h2>Report view</h2>
+<div class=line><div><label for=theme>Theme</label><span class=hint>Base GoAccess palette under the hails skin</span></div>
+<select id=theme><option value=darkBlue>Dark blue</option><option value=darkPurple>Dark purple</option><option value=darkGray>Dark gray</option><option value=bright>Bright</option></select></div>
+<div class=line><div><label for=perPage>Rows per panel</label><span class=hint>How many rows each table shows per page</span></div>
+<input id=perPage type=number min=10 max=1000 step=10></div>
+<div class=line><div><label for=layout>Layout</label><span class=hint>How the panels are arranged</span></div>
+<select id=layout><option value=horizontal>Horizontal</option><option value=vertical>Vertical</option><option value=wide>Wide</option></select></div>
+<div class=line><div><label for=autoHide>Collapse tables by default</label><span class=hint>Off shows the full tables straight away</span></div>
+<label class=sw><input id=autoHide type=checkbox><span></span></label></div>
+<div class=actions><button class=save id=save>Save preferences</button><button class=reset id=reset>Reset to defaults</button><span class=toast id=toast>Saved</span></div>
+</div>
+
+<div class=card id=admincard>
+<h2>Admin</h2>
+<div id=adminbody><p class=note>Checking access...</p></div>
+</div>
+</div>
+<script>
+(function(){
+var DEF={theme:'darkBlue',perPage:48,layout:'horizontal',autoHideTables:false};
+function read(){try{return JSON.parse(localStorage.getItem('AppPrefs')||'{}')||{};}catch(e){return {};}}
+var p=read();
+var T=document.getElementById('theme'),P=document.getElementById('perPage'),L=document.getElementById('layout'),H=document.getElementById('autoHide');
+T.value=p.theme||DEF.theme;
+P.value=(p.perPage!=null?p.perPage:DEF.perPage);
+L.value=p.layout||DEF.layout;
+H.checked=(p.autoHideTables!=null?p.autoHideTables:DEF.autoHideTables);
+function toast(m){var t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(function(){t.classList.remove('show');},1600);}
+document.getElementById('save').onclick=function(){
+var cur=read();
+cur.theme=T.value;
+cur.perPage=parseInt(P.value,10)||DEF.perPage;
+cur.layout=L.value;
+cur.autoHideTables=H.checked;
+localStorage.setItem('AppPrefs',JSON.stringify(cur));
+toast('Saved');};
+document.getElementById('reset').onclick=function(){
+localStorage.removeItem('AppPrefs');
+T.value=DEF.theme;P.value=DEF.perPage;L.value=DEF.layout;H.checked=DEF.autoHideTables;
+toast('Reset');};
+})();
+</script>
+<script>
+// Admin section: calls the admin backend through Caddy at /admin/api/*. Viewers get a notice,
+// admins get controls. Every change must send the X-Admin-CSRF header and the admin's password.
+(function(){
+var HDR={'X-Admin-CSRF':'1','Content-Type':'application/json'};
+var body=document.getElementById('adminbody');
+var ME='';
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function api(path,opts){return fetch(path,opts||{}).then(function(r){return r.json().catch(function(){return {};}).then(function(j){return {ok:r.ok,j:j};});});}
+function val(id){var e=document.getElementById(id);return e?e.value.trim():'';}
+function pw(){var e=document.getElementById('authpw');return e?e.value:'';}
+function msg(t,good){var m=document.getElementById('amsg');if(m){m.textContent=t;m.style.color=good?'#8fffca':'#ff9db2';m.classList.add('show');}}
+function render(s,keep){
+  var h='';
+  h+='<p class=note>Signed in as <b>'+esc(ME)+'</b> (admin). Enter your password once to authorize changes.</p>';
+  h+='<div class=line><div><label for=authpw>Your password</label><span class=hint>Required for every change below</span></div><input id=authpw type=password></div>';
+  h+='<div class=line><div><label>Status</label><span class=hint>'+esc(s.pages)+' pages, GeoIP '+esc(s.geoip||'n/a')+', last rebuild '+esc(s.lastRebuild||'n/a')+', timers '+esc(s.timers.stats)+'/'+esc(s.timers.geoip)+'</span></div></div>';
+  h+='<div class=actions><button class=save data-act=rebuild>Rebuild now</button><button class=reset data-act=geoip>Refresh GeoIP</button><span class=toast id=amsg></span></div>';
+  h+='<h2 style="margin-top:1.5rem">Logins</h2>';
+  s.users.forEach(function(u){
+    h+='<div class=line><div><label>'+esc(u.name)+(u.admin?' <span style="color:#6f4cff;font-size:.8rem;letter-spacing:.05em">ADMIN</span>':'')+'</label></div>';
+    h+='<div style="display:flex;gap:.5rem;flex-wrap:wrap">';
+    h+='<button class=reset data-act=role data-u="'+esc(u.name)+'" data-admin="'+(u.admin?'0':'1')+'">'+(u.admin?'Make viewer':'Make admin')+'</button>';
+    h+='<button class=reset data-act=pwreset data-u="'+esc(u.name)+'">Reset pw</button>';
+    h+='<button class=reset data-act=remove data-u="'+esc(u.name)+'">Remove</button>';
+    h+='</div></div>';
+  });
+  h+='<div class=line><div><label for=nu>Add login</label><span class=hint>Username and a password of 8 or more characters</span></div>';
+  h+='<div style="display:flex;gap:.5rem;flex-wrap:wrap"><input id=nu type=text placeholder=username style="min-width:120px"><input id=np type=password placeholder=password style="min-width:120px"><button class=save data-act=add>Add</button></div></div>';
+  body.innerHTML=h;
+  if(keep!=null){document.getElementById('authpw').value=keep;}
+}
+function load(keep){
+  api('/admin/api/status').then(function(res){
+    if(!res.ok){body.innerHTML='<p class=note>'+esc(res.j.error||'could not load status')+'</p>';return;}
+    render(res.j,keep);
+  });
+}
+function post(path,data,pending){
+  var p=pw();
+  if(!p){msg('Enter your password first',false);return;}
+  data.authPassword=p;
+  msg(pending,true);
+  api(path,{method:'POST',headers:HDR,body:JSON.stringify(data)}).then(function(res){
+    if(res.ok){msg('Done',true);setTimeout(function(){load(p);},700);}
+    else{msg(res.j.error||'failed',false);}
+  }).catch(function(){msg('network error',false);});
+}
+body.addEventListener('click',function(e){
+  var b=e.target.closest('button[data-act]');if(!b)return;
+  var act=b.getAttribute('data-act'),u=b.getAttribute('data-u');
+  if(act==='rebuild')return post('/admin/api/rebuild',{},'Rebuilding...');
+  if(act==='geoip')return post('/admin/api/geoip',{},'Refreshing GeoIP...');
+  if(act==='add'){var nu=val('nu'),np=val('np');if(!nu||!np){msg('Username and password needed',false);return;}return post('/admin/api/users/add',{username:nu,newPassword:np},'Adding '+nu+'...');}
+  if(act==='remove'){if(!confirm('Remove login '+u+'?'))return;return post('/admin/api/users/remove',{username:u},'Removing '+u+'...');}
+  if(act==='pwreset'){var np2=prompt('New password for '+u+' (8 or more characters)');if(!np2)return;return post('/admin/api/users/password',{username:u,newPassword:np2},'Updating '+u+'...');}
+  if(act==='role')return post('/admin/api/users/role',{username:u,admin:b.getAttribute('data-admin')==='1'},'Updating role...');
+});
+api('/admin/api/whoami').then(function(res){
+  if(!res.ok){body.innerHTML='<p class=note>Sign in required to view admin.</p>';return;}
+  ME=res.j.user||'';
+  if(!res.j.isAdmin){body.innerHTML='<p class=note>Signed in as <b>'+esc(ME)+'</b> (viewer). Ask an admin to manage users or run admin actions.</p>';return;}
+  load(null);
+});
+})();
+</script>

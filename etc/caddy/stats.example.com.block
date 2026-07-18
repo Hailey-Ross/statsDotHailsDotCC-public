@@ -1,0 +1,32 @@
+# Reference fragment for /etc/caddy/Caddyfile: the site block that serves the dashboard.
+# Swap stats.example.com for your own hostname and point a DNS A record at this server, so Caddy
+# can issue its own certificate. If Cloudflare sits in front of that name, set the record to grey
+# (DNS only) or the challenge will not complete.
+#
+# The logins live in a SEPARATE imported file, /etc/caddy/stats_auth (seeded by deploy.sh from
+# /root/.stats_bcrypt), so the Settings page can add and remove users without ever touching this
+# Caddyfile, which on most boxes also fronts every other site you run. The /admin path is reverse
+# proxied to the admin backend, which listens on localhost only and still sits behind the same
+# basic_auth; header_up forwards the logged in name so the backend can tell admins from viewers.
+# Everything else is a plain file server over /srv/stats.
+
+stats.example.com {
+	encode gzip zstd
+	import /etc/caddy/stats_auth
+	handle /admin/* {
+		reverse_proxy 127.0.0.1:8770 {
+			header_up X-Auth-User {http.auth.user.id}
+		}
+	}
+	handle {
+		root * /srv/stats
+		file_server
+	}
+}
+
+# /etc/caddy/stats_auth (managed by the Settings page, seeded by deploy.sh from /root/.stats_bcrypt):
+#   basic_auth {
+#       admin REPLACE_WITH_BCRYPT_HASH
+#   }
+# /etc/caddy/stats_admins (one admin username per line):
+#   admin

@@ -1,0 +1,9 @@
+[Unit]
+Description=Regenerate GoAccess analytics dashboard
+
+[Service]
+# Machine specific settings, see config.example.env. The leading dash means a missing file is
+# not an error, so the defaults apply on a fresh install.
+EnvironmentFile=-/etc/hails-stats/config.env
+Type=oneshot
+ExecStart=/usr/local/bin/hails-stats.sh

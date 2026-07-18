@@ -1,0 +1,58 @@
+# Local deploy config, never commit this
+.env
+.env.*
+!.env.example
+
+# Passwords, hashes and auth material
+*password*
+*passwd*
+.stats_bcrypt
+*bcrypt*
+.htpasswd
+*.htpasswd
+*secret*
+*.secret
+credentials*
+*.credentials
+*token*
+*.token
+apikey*
+*apikey*
+api_key*
+
+# Private keys, certs and keystores
+.ssh/
+id_rsa*
+id_ed25519*
+id_ecdsa*
+id_dsa*
+known_hosts
+known_hosts.*
+authorized_keys
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.p12
+*.pfx
+*.ppk
+
+# GeoIP databases, large binaries fetched at deploy time
+*.mmdb
+*.mmdb.gz
+
+# Generated reports, these are built on the server
+srv/
+stats-output/
+*.report.html
+
+# OS and editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.tmp

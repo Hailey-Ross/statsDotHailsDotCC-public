@@ -1,0 +1,21 @@
+[Unit]
+Description=Stats admin backend (localhost only, behind Caddy basic auth)
+After=network.target
+
+[Service]
+# Machine specific settings, see config.example.env. The leading dash means a missing file is
+# not an error, so the defaults apply on a fresh install.
+EnvironmentFile=-/etc/hails-stats/config.env
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/hails-admin.py
+Restart=on-failure
+RestartSec=2
+# Runs as root: it must edit /etc/caddy/stats_auth and reload Caddy. It binds 127.0.0.1 only and
+# sits behind the stats basic_auth, so it is never directly reachable. Modest hardening below.
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+
+[Install]
+WantedBy=multi-user.target

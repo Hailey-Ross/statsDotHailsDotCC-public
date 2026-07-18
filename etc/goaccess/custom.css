@@ -1,0 +1,141 @@
+/* Glass skin for the GoAccess reports. Change the colours here and every report follows.
+   Loaded by `html-custom-css /custom.css` in goaccess.conf, so it lands after GoAccess's own
+   app.css and overrides it. It is fetched by URL, so it must live in the web root.
+   Note: this pulls Roboto from Google Fonts, see the README if you would rather it did not. */
+
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700;900&display=swap');
+
+:root{
+  --bg:#04050c;
+  --panel:rgba(13,14,33,.55);
+  --panel-solid:rgba(13,14,33,.72);
+  --text:#e8e8f0;
+  --text-strong:#ffffff;
+  --muted:rgba(255,255,255,.58);
+  --line:rgba(255,255,255,.09);
+  --violet:#6f4cff;
+  --blue:#016eda;
+  --magenta:#d900c0;
+  --link:#0085ff;
+  --brand-grad:radial-gradient(circle at left top,#016eda,#d900c0);
+  --glow:0 0 22px rgba(111,76,255,.42);
+  --radius:16px;
+}
+
+/* Canvas: near black with three soft brand glows, fixed so glass has something to refract. */
+html,body{
+  background:var(--bg) !important;
+  color:var(--text) !important;
+  font-family:'Roboto',system-ui,-apple-system,'Segoe UI',sans-serif !important;
+}
+body{
+  background:
+    radial-gradient(1200px 620px at 50% -8%,rgba(111,76,255,.14),transparent 60%),
+    radial-gradient(1000px 520px at 92% 4%,rgba(1,110,218,.12),transparent 55%),
+    radial-gradient(900px 500px at 8% 14%,rgba(217,0,192,.08),transparent 55%),
+    var(--bg) !important;
+}
+
+/* Header area */
+.wrap-header{margin-top:8px}
+.report-title{color:var(--text-strong) !important;font-weight:700;font-size:1.18rem;letter-spacing:.01em}
+.h-dashboard,.page-header .h-dashboard{color:var(--text-strong) !important}
+.last-updated{color:var(--muted) !important}
+.label-info{background:rgba(1,110,218,.22) !important;color:#cfe0ff !important;border:1px solid rgba(1,110,218,.4)}
+.spinner{color:var(--violet) !important}
+.gheader{color:var(--text-strong) !important;font-weight:700}
+.gheader small,.panel-header small,small{color:var(--muted) !important}
+
+/* KPI tiles (General Statistics): dark glass with the blue to magenta gradient rim. */
+.wrap-general .grid-module{
+  position:relative;
+  background:
+    linear-gradient(var(--panel-solid),var(--panel-solid)) padding-box,
+    var(--brand-grad) border-box;
+  border:1.5px solid transparent;
+  border-radius:14px;
+  box-shadow:0 6px 20px rgba(0,0,0,.4);
+  padding:14px 16px;
+  min-height:96px;
+  transition:box-shadow .3s ease,transform .3s ease;
+}
+.wrap-general .grid-module:hover{box-shadow:0 6px 20px rgba(0,0,0,.45),var(--glow);transform:translateY(-2px)}
+.wrap-general .grid-module .col-title{color:var(--muted) !important;font-size:11.5px;letter-spacing:.05em;text-transform:uppercase}
+.wrap-general .grid-module .col-title .fa{color:var(--violet)}
+.wrap-general .grid-module h3{color:var(--text-strong) !important;font-weight:700}
+
+/* Panels: each report panel is a wrap-panels > row, styled as a solid translucent card.
+   Do not add backdrop-filter blur here, it makes scrolling janky and looks the same anyway. */
+.wrap-panels > .row{
+  background:rgba(13,14,33,.85);
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  box-shadow:0 8px 30px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.06);
+  padding:18px 22px;
+  margin:0 0 22px !important;
+  transition:box-shadow .3s ease,border-color .3s ease;
+}
+.wrap-panels > .row:hover{
+  border-color:rgba(111,76,255,.5);
+  box-shadow:0 8px 30px rgba(0,0,0,.5),var(--glow),inset 0 1px 0 rgba(255,255,255,.08);
+}
+
+/* Tables */
+.table{color:var(--text) !important}
+.table thead th,.thead-cols,.thead-cols th,.thead-min,.thead-max,.thead-avg{
+  color:var(--muted) !important;
+  background:rgba(255,255,255,.03) !important;
+  border-bottom:1px solid var(--line) !important;
+  font-weight:500;
+}
+.table td,.table th{border-color:rgba(255,255,255,.07) !important}
+.table.table-hover tbody tr:hover td{background:rgba(111,76,255,.1) !important}
+.tfoot-totals td,tfoot td{color:#cfe0ff !important;background:rgba(1,110,218,.1) !important;font-weight:600}
+.expandable > td{cursor:pointer}
+
+/* Percentage bars inside cells */
+.progress{background:rgba(255,255,255,.06) !important}
+.progress-bar{background:linear-gradient(90deg,var(--blue),var(--magenta)) !important}
+
+/* Pagination */
+.pagination > li > a,.pagination > li > span{
+  background:rgba(13,14,33,.6) !important;color:#cfe0ff !important;border:1px solid var(--line) !important;
+}
+.pagination > li > a:hover{background:rgba(111,76,255,.25) !important}
+.pagination > .active > a,.pagination > .active > span{
+  background:linear-gradient(90deg,var(--blue),var(--magenta)) !important;border-color:transparent !important;color:#fff !important;
+}
+
+/* Buttons and dropdowns (panel options gear) */
+.btn-default{
+  background:rgba(255,255,255,.06) !important;color:var(--text) !important;
+  border:1px solid rgba(255,255,255,.14) !important;border-radius:9px !important;
+}
+.btn-default:hover,.btn-default:focus{background:rgba(111,76,255,.22) !important;color:#fff !important}
+.dropdown-menu{background:rgba(10,11,26,.97) !important;border:1px solid var(--line) !important;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+.dropdown-menu > li > a{color:var(--text) !important}
+.dropdown-menu > li > a:hover{background:rgba(111,76,255,.25) !important;color:#fff !important}
+
+/* Hide GoAccess's left sidebar and its toggle icons, replaced by the top bar dropdowns,
+   then reclaim the left margin it reserved. */
+nav{display:none !important}
+.nav-bars,.nav-gears,.nav-minibars,.nav-ws-status,.nav-ws-status.mini{display:none !important}
+.container-fluid{margin-left:auto !important}
+
+/* Charts (D3 SVG) */
+.chart-wrap svg text{fill:rgba(255,255,255,.72) !important}
+.chart-wrap .axis path,.chart-wrap .axis line,.chart-wrap .tick line,.chart-wrap .domain{stroke:rgba(255,255,255,.13) !important}
+.chart-wrap .bar,.chart-wrap rect.bar{fill:#4c7cff !important}
+.chart-wrap .bar:hover,.chart-wrap rect.bar:hover{fill:var(--violet) !important}
+.chart-wrap .area{fill:rgba(111,76,255,.25) !important}
+.chart-wrap .line{stroke:var(--violet) !important;fill:none}
+
+/* Links inside the report only, so the injected top bar keeps its own styling. */
+.container a{color:var(--link) !important}
+.container a:hover{color:#4c9dff !important}
+
+/* Scrollbar */
+::-webkit-scrollbar{width:12px;height:12px}
+::-webkit-scrollbar-track{background:#0a0b16}
+::-webkit-scrollbar-thumb{background:#2a2c46;border-radius:30px;border:2px solid #0a0b16}
+::-webkit-scrollbar-thumb:hover{background:#3a3d5e}
