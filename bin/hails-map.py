@@ -578,7 +578,7 @@ def build_public_page(hosts):
     desc = "The %s network: %s and how they connect." % (ORG, ", ".join(regs))
     sub = "%d sites across %d domains, and how they link together." % (len(ph), len(regs))
     return (PUBPAGE.replace("__ORG__", esc(ORG))
-                   .replace("__DESC__", esc(desc)).replace("__CANON__", CANON)
+                   .replace("__DESC__", esc(desc)).replace("__CANON__", esc(CANON))
                    .replace("__FAVICON__", FAVICON).replace("__JSONLD__", build_jsonld(ph))
                    .replace("__STYLE__", STYLE).replace("__SUB__", esc(sub))
                    .replace("__SVG__", build_public_svg(ph)).replace("__TABLE__", build_public_table(ph))

@@ -21,7 +21,7 @@ A landing page listing every domain Caddy serves, and for each one:
 * **Bandwidth** with daily, weekly, monthly, yearly and all time views
 * **Time Distribution** by hour of day, day of week and week of month
 * **Performance**, an htop style view of the server: load, memory, storage, disk IO, network IO,
-  per core CPU, uptime, and per service uptime
+  per core CPU, uptime, and per service uptime, with a card per disk and per volume
 * **Network map**, a diagram of your hosts and what each one proxies to
 
 Every page has a Domain and a Panel dropdown at the top, so you can jump straight from
@@ -136,7 +136,7 @@ Open your dashboard and you should have reports.
 ```
 
 Separately, `hails-perf-collect.py` runs all the time, sampling `/proc` every 10 seconds so the
-Performance page has real history. It costs about 13 MB of memory and a hundredth of one core.
+Performance page has real history. It costs under 20 MB of memory and about a hundredth of one core.
 
 Almost everything is rebuilt from the raw log every 5 minutes, which means `/srv/stats` is disposable.
 Two things are not, and they live in `/var/lib/hails-stats`:
@@ -147,6 +147,25 @@ Two things are not, and they live in `/var/lib/hails-stats`:
 
 Do not delete that directory unless you mean to lose the history.
 
+## When you resize the server
+
+The collector looks at the hardware each time it starts, so new cores, disks, volumes and interfaces
+just appear on the page after `systemctl restart hails-perf`.
+
+The part worth knowing is that **your history survives it**. Every countable thing keeps its own ring
+files, so adding a core creates one new set and leaves everything else alone. Your load, memory and
+network history are not disturbed, and neither are the cores you already had. Only genuinely new
+hardware starts from empty, and it says `collecting` until it has enough of its own data to fill a
+window rather than borrowing anyone else's.
+
+Two related habits worth keeping:
+
+* Interfaces are only tracked when they are real hardware, so docker bridges and the `veth` pairs
+  that come and go with containers are ignored. Without that the store would fill with dead files.
+* If you ever edit the metric list in the source, that does change the record width for that group.
+  The old file is moved aside as `.bin.old` and the change is logged rather than being overwritten,
+  so you can still get at the data.
+
 ## Configuration
 
 Everything machine specific is in `/etc/hails-stats/config.env`. The ones you will actually care
@@ -154,8 +173,8 @@ about:
 
 | Setting | What it does |
 |---|---|
-| `HAILS_PERF_DISK` | Disk for the Disk IO panel. Detected if unset, run `lsblk` to check |
-| `HAILS_PERF_NIC` | Interface for Network IO. Detected if unset, must be your real NIC and not `docker0` |
+| `HAILS_PERF_DISK` | Comma separated disks to chart. All of them are found for you, so this is only for pinning the list by hand |
+| `HAILS_PERF_NIC` | Comma separated interfaces. Physical ones are found for you and docker bridges and veths are skipped |
 | `HAILS_PERF_UNITS` | systemd units to show on the Performance page, comma separated |
 | `HAILS_PERF_TARGETS` | Sites to probe for uptime, as `name\|url\|healthy codes` separated by semicolons |
 | `HAILS_MAP_ORG` | Name shown on the network map |

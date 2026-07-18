@@ -4,7 +4,10 @@
 #   python3 hails-perf-collect.py            (run by hails-perf.service, no arguments)
 #
 # Samples /proc plus service and HTTP probes, and writes fixed size binary rings, perf_meta.json and
-# perf_svc.json under /var/lib/hails-stats. hails-perf.py renders what it collects.
+# perf_svc.json under /var/lib/hails-stats. hails-perf.py renders what it collects. Nothing here has
+# a history to read from: every /proc counter is cumulative since boot, so this daemon is the only
+# source of the past.
+#
 # Stdlib only, single threaded, rings allocated once and never grown.
 #
 # Tiers, and the window each one serves:
@@ -14,92 +17,39 @@
 #   1 day, 5 years      : year
 # Rollups cascade: raw closes into 5 min, 5 min into hourly, hourly into daily.
 #
+# Hardware is discovered at startup, so a resized box picks up new cores, disks, volumes and NICs on
+# the next restart. Each entity owns its own ring files, which is what makes that safe: adding a core
+# creates one new set of files and leaves every existing ring untouched. Sharing one wide record
+# would mean the record width changed, and a width change wipes every tier.
+#
 # Configuration comes from the environment, normally /etc/hails-stats/config.env.
-import os, sys, time, json, struct, subprocess, socket, urllib.request, urllib.error
+#
+# No dash punctuation in text: commas and colons only.
+import os, sys, time, json, struct, subprocess, zlib, urllib.request, urllib.error
 
 DIR = os.environ.get("HAILS_PERF_DIR", "/var/lib/hails-stats")
 INTERVAL = float(os.environ.get("HAILS_PERF_INTERVAL", "10"))     # sample cadence, seconds
 HTTP_EVERY = float(os.environ.get("HAILS_PERF_HTTP", "300"))      # HTTP probe cadence
 LOCAL_EVERY = float(os.environ.get("HAILS_PERF_LOCAL", "300"))    # systemd and docker cadence
 SVC_FLUSH = 300.0                                                 # service json flush cadence
-SCHEMA = 1
-
-
-def detect_disk():
-    """Return the first non removable whole disk name in /sys/block."""
-    try:
-        for name in sorted(os.listdir("/sys/block")):
-            if name.startswith(("loop", "ram", "dm-", "sr", "zram")):
-                continue
-            try:
-                with open("/sys/block/%s/removable" % name) as fh:
-                    if fh.read().strip() == "1":
-                        continue
-            except Exception:
-                pass
-            return name
-    except Exception:
-        pass
-    return "sda"
-
-
-def detect_nic():
-    """Return the interface holding the default route."""
-    try:
-        with open("/proc/net/route") as fh:
-            for line in fh.readlines()[1:]:
-                f = line.split()
-                if len(f) > 1 and f[1] == "00000000":     # destination 0.0.0.0 is the default route
-                    return f[0]
-    except Exception:
-        pass
-    return "eth0"
-
-
-def core_count():
-    n = 0
-    try:
-        with open("/proc/stat") as fh:
-            for line in fh:
-                if line.startswith("cpu") and line[3:4].isdigit():
-                    n += 1
-    except Exception:
-        pass
-    return n or 1
-
-
-DISK = os.environ.get("HAILS_PERF_DISK") or detect_disk()         # the disk to chart, see lsblk
-NIC = os.environ.get("HAILS_PERF_NIC") or detect_nic()            # the WAN NIC, not docker0 or veth
-CORES = core_count()
-
-# The metric vector. This is the on disk order: appending is safe, reordering is not, so bump SCHEMA
-# if you reorder and the rings will be rebuilt rather than misread.
-# NAMES goes into perf_meta.json and hails-perf.py builds its CPU columns from it. A change in core
-# count changes the record width, so the rings are reallocated and the old history is lost.
-NAMES = (["load1", "load5", "load15", "cpu"]
-         + ["cpu%d" % i for i in range(CORES)]
-         + ["steal", "iowait",
-            "mem_pct", "mem_used", "swap_used", "mem_total", "swap_total",
-            "dsk_read", "dsk_write", "dsk_iops", "dsk_util",
-            "net_rx", "net_tx",
-            "fs_pct", "fs_used", "fs_total", "fs_avail"])
-NM = len(NAMES)
-IX = {n: i for i, n in enumerate(NAMES)}
-
-RAW_FMT = "<I" + "f" * NM                 # ts, then one float per metric
-RAW_SZ = struct.calcsize(RAW_FMT)
-AGG_FMT = "<IH" + "f" * (NM * 3)          # ts, n, then sum[], min[], max[]
-AGG_SZ = struct.calcsize(AGG_FMT)
-
-# (key, filename, record size, slot count, bucket seconds).
-TIERS = [("raw", "perf_raw.bin", RAW_SZ, 1080, 0),
-         # 2100 slots not 2016: a week is exactly 2016 buckets, so the extra slots give margin.
-         ("5m", "perf_5m.bin", AGG_SZ, 2100, 300),
-         ("1h", "perf_1h.bin", AGG_SZ, 8760, 3600),
-         ("1d", "perf_1d.bin", AGG_SZ, 1825, 86400)]
+SCHEMA = 2
 
 META = os.path.join(DIR, "perf_meta.json")
 SVCF = os.path.join(DIR, "perf_svc.json")
+
+# Metrics held per entity in each group. Widths here are fixed, only the number of entities varies.
+GROUPS = {
+    "sys":  ["load1", "load5", "load15", "cpu", "steal", "iowait",
+             "mem_pct", "mem_used", "mem_total", "swap_used", "swap_total"],
+    "cpu":  ["busy"],
+    "disk": ["read", "write", "iops", "util"],
+    "fs":   ["pct", "used", "total", "avail"],
+    "net":  ["rx", "tx"],
+}
+
+# (tier key, slot count, bucket seconds). 2100 five minute slots not 2016: a week is exactly 2016,
+# so the exact figure would leave the week window resting on the single oldest record.
+TIERS = [("raw", 1080, 0), ("5m", 2100, 300), ("1h", 8760, 3600), ("1d", 1825, 86400)]
 
 
 def log(msg):
@@ -107,25 +57,161 @@ def log(msg):
     sys.stderr.flush()
 
 
+def safe(name):
+    return "".join(c if c.isalnum() else "_" for c in name).strip("_") or "root"
+
+
+def read(path):
+    with open(path, "r") as fh:
+        return fh.read()
+
+
+# Hardware discovery. Runs once at startup, so new hardware appears after a restart.
+def list_cores():
+    out = []
+    try:
+        for line in read("/proc/stat").splitlines():
+            if line.startswith("cpu") and line[3:4].isdigit():
+                out.append(line.split()[0])
+    except Exception:
+        pass
+    return out or ["cpu0"]
+
+
+def list_disks():
+    """Whole disks worth charting, skipping loop, ram, device mapper, optical and removable.
+    HAILS_PERF_DISK pins the list by hand if discovery ever picks wrong."""
+    pin = os.environ.get("HAILS_PERF_DISK", "").strip()
+    if pin:
+        return [d.strip() for d in pin.split(",") if d.strip()]
+    out = []
+    try:
+        for name in sorted(os.listdir("/sys/block")):
+            if name.startswith(("loop", "ram", "dm-", "sr", "zram", "md")):
+                continue
+            try:
+                if read("/sys/block/%s/removable" % name).strip() == "1":
+                    continue
+            except Exception:
+                pass
+            out.append(name)
+    except Exception:
+        pass
+    return out
+
+
+SKIP_FS = {"tmpfs", "devtmpfs", "overlay", "squashfs", "proc", "sysfs", "cgroup", "cgroup2",
+           "devpts", "debugfs", "tracefs", "securityfs", "pstore", "bpf", "configfs", "fusectl",
+           "hugetlbfs", "mqueue", "autofs", "binfmt_misc", "efivarfs", "ramfs", "nsfs", "rpc_pipefs"}
+
+
+def list_filesystems():
+    """Real on disk filesystems as (mount, device), deduplicated by device so bind mounts and
+    container layers do not appear several times."""
+    out = []
+    seen = set()
+    try:
+        for line in read("/proc/mounts").splitlines():
+            f = line.split()
+            if len(f) < 3:
+                continue
+            dev, mount, kind = f[0], f[1], f[2]
+            if kind in SKIP_FS or not dev.startswith("/dev/"):
+                continue
+            if dev in seen:
+                continue
+            seen.add(dev)
+            out.append((mount.replace("\\040", " "), dev))
+    except Exception:
+        pass
+    return out
+
+
+def list_nics():
+    """Physical interfaces only. A NIC is kept when it has a device symlink, which selects the real
+    hardware and drops lo, docker0, every br- bridge and every veth. Those veth pairs are created and
+    destroyed with each container, so charting them would fill the store with dead files.
+    HAILS_PERF_NIC pins the list by hand if discovery ever picks wrong."""
+    pin = os.environ.get("HAILS_PERF_NIC", "").strip()
+    if pin:
+        return [n.strip() for n in pin.split(",") if n.strip()]
+    out = []
+    try:
+        for name in sorted(os.listdir("/sys/class/net")):
+            if os.path.exists("/sys/class/net/%s/device" % name):
+                out.append(name)
+    except Exception:
+        pass
+    return out or ["lo"]
+
+
+# Ring files
 class Ring(object):
     """A fixed size ring of packed records. Allocated once, written one slot at a time."""
 
     def __init__(self, path, recsz, slots):
         self.path, self.recsz, self.slots = path, recsz, slots
-        self.head = 0          # next slot to write
-        self.count = 0         # records written, capped at slots
+        self.head = 0
+        self.count = 0
         want = recsz * slots
+        # Decide create versus open on the size ALONE. Anything else that can go wrong, a short read
+        # or a bad unpack, must not reach the branch that zero fills the file, or a transient IO
+        # error would cost the five year ring.
         try:
-            if os.path.getsize(path) != want:
-                raise OSError("size mismatch")
-            self.fh = open(path, "r+b")
+            usable = os.path.getsize(path) == want
         except Exception:
-            # Allocate the whole ring up front so the on disk footprint is fixed.
-            self.fh = open(path, "w+b")
-            self.fh.write(b"\0" * want)
-            self.fh.flush()
-            self.head = 0
-            self.count = 0
+            usable = False
+
+        if usable:
+            self.fh = open(path, "r+b")
+            try:
+                self.scan()
+            except Exception as e:
+                # Unreadable content, but the file is the right size, so keep it and append from the
+                # start rather than destroying records that may still be perfectly good.
+                log("could not scan %s (%s), appending from slot 0" % (os.path.basename(path), e))
+                self.head = 0
+                self.count = 0
+            return
+
+        # Wrong size means the metric list for this group changed, so the old records cannot be read
+        # back. Move them aside and say so rather than truncating in place. Hardware changes do NOT
+        # come through here: each entity owns a file of its own fixed width.
+        if os.path.exists(path):
+            try:
+                os.replace(path, path + ".old")
+                log("layout changed for %s, previous data kept as %s.old"
+                    % (os.path.basename(path), os.path.basename(path)))
+            except Exception:
+                pass
+        self.fh = open(path, "w+b")
+        self.fh.write(b"\0" * want)
+        self.fh.flush()
+        self.head = 0
+        self.count = 0
+
+    def scan(self):
+        """Recover head and count from the file itself by finding the newest timestamp.
+
+        The alternative is trusting the pointers in perf_meta.json, which are only flushed once a
+        minute, so a restart would rewind head and overwrite the most recent records. Every record
+        starts with its own timestamp, and an unwritten slot is zeroed, so the file can always say
+        where it got to."""
+        self.fh.seek(0)
+        buf = self.fh.read()
+        newest = 0
+        newest_at = -1
+        used = 0
+        for i in range(self.slots):
+            ts = struct.unpack_from("<I", buf, i * self.recsz)[0]
+            if not ts:
+                continue
+            used += 1
+            if ts >= newest:
+                newest = ts
+                newest_at = i
+        self.count = used
+        self.head = 0 if newest_at < 0 else (newest_at + 1) % self.slots
 
     def append(self, blob):
         self.fh.seek(self.head * self.recsz)
@@ -135,26 +221,122 @@ class Ring(object):
         if self.count < self.slots:
             self.count += 1
 
-    def read_all(self):
-        """Return every record as packed bytes, oldest first."""
-        if not self.count:
-            return []
-        self.fh.seek(0)
-        buf = self.fh.read()
-        out = []
-        start = (self.head - self.count) % self.slots
-        for i in range(self.count):
-            s = ((start + i) % self.slots) * self.recsz
-            out.append(buf[s:s + self.recsz])
-        return out
+
+class Bucket(object):
+    """Running n, sum, min, max per metric for one time bucket of one entity."""
+
+    def __init__(self, bid, nm):
+        self.bid = bid
+        self.nm = nm
+        self.n = 0
+        self.sum = [0.0] * nm
+        self.min = [0.0] * nm
+        self.max = [0.0] * nm
+
+    def add_sample(self, v):
+        if self.n == 0:
+            self.min = list(v)
+            self.max = list(v)
+        else:
+            for i in range(self.nm):
+                if v[i] < self.min[i]:
+                    self.min[i] = v[i]
+                if v[i] > self.max[i]:
+                    self.max[i] = v[i]
+        for i in range(self.nm):
+            self.sum[i] += v[i]
+        self.n += 1
+
+    def add_bucket(self, b):
+        """Fold a lower tier bucket in, so hourly is built from the 5 min buckets, not from raw."""
+        if b.n == 0:
+            return
+        if self.n == 0:
+            self.min = list(b.min)
+            self.max = list(b.max)
+        else:
+            for i in range(self.nm):
+                if b.min[i] < self.min[i]:
+                    self.min[i] = b.min[i]
+                if b.max[i] > self.max[i]:
+                    self.max[i] = b.max[i]
+        for i in range(self.nm):
+            self.sum[i] += b.sum[i]
+        self.n += b.n
+
+    def pack(self, fmt):
+        return struct.pack(fmt, self.bid, min(self.n, 65535), *(self.sum + self.min + self.max))
+
+    def to_dict(self):
+        return {"bid": self.bid, "n": self.n, "sum": self.sum, "min": self.min, "max": self.max}
+
+    @staticmethod
+    def from_dict(d, nm):
+        try:
+            if len(d["sum"]) != nm or len(d["min"]) != nm or len(d["max"]) != nm:
+                return None
+            b = Bucket(int(d["bid"]), nm)
+            b.n = int(d["n"])
+            b.sum = [float(x) for x in d["sum"]]
+            b.min = [float(x) for x in d["min"]]
+            b.max = [float(x) for x in d["max"]]
+            return b
+        except Exception:
+            return None
 
 
-# /proc readers.
-def read(path):
-    with open(path, "r") as fh:
-        return fh.read()
+class Series(object):
+    """One entity's four tier ring set. Adding an entity creates new files and disturbs nothing."""
+
+    def __init__(self, group, entity, metrics, key=None):
+        self.group, self.entity, self.metrics = group, entity, metrics
+        self.nm = len(metrics)
+        self.raw_fmt = "<I" + "f" * self.nm
+        self.agg_fmt = "<IH" + "f" * (self.nm * 3)
+        raw_sz = struct.calcsize(self.raw_fmt)
+        agg_sz = struct.calcsize(self.agg_fmt)
+        self.key = key or (group if entity is None else "%s_%s" % (group, safe(entity)))
+        self.rings = {}
+        self.open_b = {}
+        for tier, slots, secs in TIERS:
+            path = os.path.join(DIR, "perf_%s_%s.bin" % (self.key, tier))
+            self.rings[tier] = Ring(path, raw_sz if tier == "raw" else agg_sz, slots)
+            if secs:
+                self.open_b[tier] = None
+
+    def add(self, now, v):
+        self.rings["raw"].append(struct.pack(self.raw_fmt, int(now), *v))
+        # Each tier is keyed on the timestamp of the item being folded in, never on now: 5 min
+        # boundaries align with hour boundaries, so at the top of an hour the closing 5 min bucket
+        # still belongs to the hour that just ended.
+        carry = None
+        for tier, _, secs in TIERS:
+            if not secs:
+                continue
+            if tier == "5m":
+                item_ts, item = now, v
+            else:
+                if carry is None:
+                    break
+                item_ts, item = carry.bid, carry
+            bid = int(item_ts // secs) * secs
+            b = self.open_b.get(tier)
+            closed = None
+            if b is not None and b.bid != bid:
+                self.rings[tier].append(b.pack(self.agg_fmt))
+                closed = b
+                b = None
+            if b is None:
+                b = Bucket(bid, self.nm)
+                self.open_b[tier] = b
+            if tier == "5m":
+                b.add_sample(item)
+            else:
+                b.add_bucket(item)
+            carry = closed
 
 
+# /proc readers
 def proc_loadavg():
     p = read("/proc/loadavg").split()
     return float(p[0]), float(p[1]), float(p[2])
@@ -167,14 +349,11 @@ def proc_stat():
         if not line.startswith("cpu"):
             continue
         f = line.split()
-        key = f[0]
         v = [int(x) for x in f[1:]]
         while len(v) < 8:
             v.append(0)
-        user, nice, sysj, idle, iowait, irq, softirq, steal = v[:8]
         total = sum(v[:8])
-        busy = total - idle - iowait
-        out[key] = (busy, total, steal, iowait)
+        out[f[0]] = (total - v[3] - v[4], total, v[7], v[4])
     return out
 
 
@@ -189,37 +368,38 @@ def proc_meminfo():
     total = m.get("MemTotal", 0)
     avail = m.get("MemAvailable", m.get("MemFree", 0))
     swtot = m.get("SwapTotal", 0)
-    swfree = m.get("SwapFree", 0)
-    return total, total - avail, swtot - swfree, swtot
+    return total, total - avail, swtot - m.get("SwapFree", 0), swtot
 
 
 def proc_diskstats():
+    """{device: (reads, sectors read, writes, sectors written, io_ticks)}."""
+    out = {}
     for line in read("/proc/diskstats").splitlines():
         f = line.split()
-        if len(f) > 13 and f[2] == DISK:
-            # reads, sectors read, writes, sectors written, io_ticks (ms the disk was busy)
-            return int(f[3]), int(f[5]), int(f[7]), int(f[9]), int(f[12])
-    return None
+        if len(f) > 13:
+            out[f[2]] = (int(f[3]), int(f[5]), int(f[7]), int(f[9]), int(f[12]))
+    return out
 
 
 def proc_netdev():
+    """{interface: (rx bytes, tx bytes)}."""
+    out = {}
     for line in read("/proc/net/dev").splitlines():
         name, _, rest = line.partition(":")
-        if name.strip() == NIC:
-            f = rest.split()
-            return int(f[0]), int(f[8])       # rx bytes, tx bytes
-    return None
+        f = rest.split()
+        if len(f) > 8:
+            out[name.strip()] = (int(f[0]), int(f[8]))
+    return out
 
 
 def proc_uptime():
     return float(read("/proc/uptime").split()[0])
 
 
-def fs_usage():
-    """Return total, used, available and used percent, following df's convention.
-
-    Use% is computed against used plus available, which excludes the root reserved blocks."""
-    st = os.statvfs("/")
+def fs_usage(mount):
+    """Total, used, available and used percent, following df: the percent is used over used plus
+    available, which excludes the blocks reserved for root."""
+    st = os.statvfs(mount)
     total = st.f_blocks * st.f_frsize
     used = (st.f_blocks - st.f_bfree) * st.f_frsize
     avail = st.f_bavail * st.f_frsize
@@ -228,7 +408,7 @@ def fs_usage():
 
 
 def delta(cur, prev):
-    """Return the counter delta, or None if the counter went backwards (a reboot or a lost device)."""
+    """Counter delta, or None if it went backwards, which means a reboot or a vanished device."""
     if cur is None or prev is None:
         return None
     d = cur - prev
@@ -236,39 +416,33 @@ def delta(cur, prev):
 
 
 class Sampler(object):
-    def __init__(self):
+    """Reads /proc once per tick and returns {(group, entity): [values]}."""
+
+    def __init__(self, cores, disks, fs, nics):
+        self.cores, self.disks, self.fs, self.nics = cores, disks, fs, nics
         self.prev = None
-        self.prev_t = None
 
     def take(self):
-        """Return a list of NM floats, or None if this is the first sample (no deltas yet)."""
         now = time.time()
-        cpu = proc_stat()
-        dsk = proc_diskstats()
-        net = proc_netdev()
-        cur = (now, cpu, dsk, net)
-        prev, self.prev = self.prev, cur
+        cpu, dsk, net = proc_stat(), proc_diskstats(), proc_netdev()
+        prev, self.prev = self.prev, (now, cpu, dsk, net)
         if prev is None:
-            return None
+            return now, None
         pt, pcpu, pdsk, pnet = prev
         dt = now - pt
         if dt <= 0:
-            return None
+            return now, None
 
-        v = [0.0] * NM
-        v[IX["load1"]], v[IX["load5"]], v[IX["load15"]] = proc_loadavg()
-
-        # A counter going backwards means a reboot between samples, so the whole vector is dropped
-        # rather than zero filled.
+        # A counter going backwards means the machine rebooted between samples, so the whole cycle is
+        # dropped rather than zero filled: a zero would drag every mean containing it down.
         regressed = [False]
 
-        def d(cur_v, prev_v):
-            out = delta(cur_v, prev_v)
+        def d(c, p):
+            out = delta(c, p)
             if out is None:
                 regressed[0] = True
             return out
 
-        # CPU busy percent, aggregate and per core.
         def cpu_pct(key):
             c, p = cpu.get(key), pcpu.get(key)
             if not c or not p:
@@ -276,133 +450,62 @@ class Sampler(object):
             dtot = d(c[1], p[1])
             if not dtot:
                 return 0.0, 0.0, 0.0
-            dbusy = d(c[0], p[0]) or 0
-            dsteal = d(c[2], p[2]) or 0
-            dio = d(c[3], p[3]) or 0
-            return (dbusy * 100.0 / dtot, dsteal * 100.0 / dtot, dio * 100.0 / dtot)
+            return ((d(c[0], p[0]) or 0) * 100.0 / dtot, (d(c[2], p[2]) or 0) * 100.0 / dtot,
+                    (d(c[3], p[3]) or 0) * 100.0 / dtot)
 
-        v[IX["cpu"]], v[IX["steal"]], v[IX["iowait"]] = cpu_pct("cpu")
-        for i in range(CORES):
-            k = "cpu%d" % i
-            if k in IX:
-                v[IX[k]] = cpu_pct(k)[0]
-
+        out = {}
+        l1, l5, l15 = proc_loadavg()
+        agg, steal, iowait = cpu_pct("cpu")
         mtot, mused, swused, swtot = proc_meminfo()
-        v[IX["mem_used"]] = float(mused)
-        v[IX["swap_used"]] = float(swused)
-        v[IX["mem_total"]] = float(mtot)
-        v[IX["swap_total"]] = float(swtot)
-        v[IX["mem_pct"]] = (mused * 100.0 / mtot) if mtot else 0.0
+        out[("sys", None)] = [l1, l5, l15, agg, steal, iowait,
+                              (mused * 100.0 / mtot) if mtot else 0.0,
+                              float(mused), float(mtot), float(swused), float(swtot)]
 
-        if dsk and pdsk:
-            drd = d(dsk[1], pdsk[1])
-            dwr = d(dsk[3], pdsk[3])
-            dio = d(dsk[0], pdsk[0])
-            dio2 = d(dsk[2], pdsk[2])
-            dtick = d(dsk[4], pdsk[4])
-            if drd is not None:
-                v[IX["dsk_read"]] = drd * 512.0 / dt
-            if dwr is not None:
-                v[IX["dsk_write"]] = dwr * 512.0 / dt
-            if dio is not None and dio2 is not None:
-                v[IX["dsk_iops"]] = (dio + dio2) / dt
-            if dtick is not None:
-                v[IX["dsk_util"]] = min(100.0, dtick / (dt * 1000.0) * 100.0)
+        for c in self.cores:
+            out[("cpu", c)] = [cpu_pct(c)[0]]
 
-        if net and pnet:
-            drx = d(net[0], pnet[0])
-            dtx = d(net[1], pnet[1])
-            if drx is not None:
-                v[IX["net_rx"]] = drx / dt
-            if dtx is not None:
-                v[IX["net_tx"]] = dtx / dt
+        for name in self.disks:
+            c, p = dsk.get(name), pdsk.get(name)
+            if not c or not p:
+                continue
+            drd, dwr = d(c[1], p[1]), d(c[3], p[3])
+            dio, dio2, dtick = d(c[0], p[0]), d(c[2], p[2]), d(c[4], p[4])
+            out[("disk", name)] = [
+                (drd * 512.0 / dt) if drd is not None else 0.0,
+                (dwr * 512.0 / dt) if dwr is not None else 0.0,
+                ((dio + dio2) / dt) if (dio is not None and dio2 is not None) else 0.0,
+                min(100.0, dtick / (dt * 1000.0) * 100.0) if dtick is not None else 0.0]
+
+        for name in self.nics:
+            c, p = net.get(name), pnet.get(name)
+            if not c or not p:
+                continue
+            drx, dtx = d(c[0], p[0]), d(c[1], p[1])
+            out[("net", name)] = [(drx / dt) if drx is not None else 0.0,
+                                  (dtx / dt) if dtx is not None else 0.0]
 
         if regressed[0]:
-            return None                   # the machine rebooted between samples, drop this vector
+            return now, None
 
-        ftot, fused, favail, fpct = fs_usage()
-        v[IX["fs_total"]] = float(ftot)
-        v[IX["fs_used"]] = float(fused)
-        v[IX["fs_avail"]] = float(favail)
-        v[IX["fs_pct"]] = fpct
-        return v
-
-
-class Bucket(object):
-    """Running n, sum, min, max per metric for one time bucket."""
-
-    def __init__(self, bid):
-        self.bid = bid
-        self.n = 0
-        self.sum = [0.0] * NM
-        self.min = [0.0] * NM
-        self.max = [0.0] * NM
-
-    def add_sample(self, v):
-        if self.n == 0:
-            self.min = list(v)
-            self.max = list(v)
-        else:
-            for i in range(NM):
-                if v[i] < self.min[i]:
-                    self.min[i] = v[i]
-                if v[i] > self.max[i]:
-                    self.max[i] = v[i]
-        for i in range(NM):
-            self.sum[i] += v[i]
-        self.n += 1
-
-    def add_bucket(self, b):
-        """Fold a lower tier bucket in, so each tier is built from the one below it."""
-        if b.n == 0:
-            return
-        if self.n == 0:
-            self.min = list(b.min)
-            self.max = list(b.max)
-        else:
-            for i in range(NM):
-                if b.min[i] < self.min[i]:
-                    self.min[i] = b.min[i]
-                if b.max[i] > self.max[i]:
-                    self.max[i] = b.max[i]
-        for i in range(NM):
-            self.sum[i] += b.sum[i]
-        self.n += b.n
-
-    def pack(self):
-        return struct.pack(AGG_FMT, self.bid, min(self.n, 65535),
-                           *(self.sum + self.min + self.max))
-
-    def to_dict(self):
-        return {"bid": self.bid, "n": self.n, "sum": self.sum, "min": self.min, "max": self.max}
-
-    @staticmethod
-    def from_dict(d):
-        try:
-            if len(d["sum"]) != NM or len(d["min"]) != NM or len(d["max"]) != NM:
-                return None
-            b = Bucket(int(d["bid"]))
-            b.n = int(d["n"])
-            b.sum = [float(x) for x in d["sum"]]
-            b.min = [float(x) for x in d["min"]]
-            b.max = [float(x) for x in d["max"]]
-            return b
-        except Exception:
-            return None
+        for mount, _dev in self.fs:
+            try:
+                ftot, fused, favail, fpct = fs_usage(mount)
+            except Exception:
+                continue
+            out[("fs", mount)] = [fpct, float(fused), float(ftot), float(favail)]
+        return now, out
 
 
+# Service probes
 def parse_units(raw):
     return [u.strip() if u.strip().endswith(".service") else u.strip() + ".service"
             for u in raw.split(",") if u.strip()]
 
 
 def parse_targets(raw):
-    """Parse HAILS_PERF_TARGETS, a semicolon separated list of name|url|codes, into tuples.
-
-        site|https://example.com/|200 ; shortener|https://l.example.com/|200,301
-
-    Codes are the statuses that count as healthy for that host, since a redirect or an auth
-    challenge is the correct answer for some of them."""
+    """HAILS_PERF_TARGETS is name|url|codes entries separated by semicolons. The codes are the
+    statuses that count as healthy, which matters because plenty of healthy hosts answer a redirect
+    or an auth challenge on their root."""
     out = []
     for chunk in raw.split(";"):
         parts = [p.strip() for p in chunk.split("|")]
@@ -411,24 +514,21 @@ def parse_targets(raw):
         codes = (200,)
         if len(parts) > 2 and parts[2]:
             try:
-                codes = tuple(int(c) for c in parts[2].split(",") if c.strip())
+                codes = tuple(int(c) for c in parts[2].split(",") if c.strip()) or (200,)
             except ValueError:
                 codes = (200,)
-        out.append((parts[0], parts[1], codes or (200,)))
+        out.append((parts[0], parts[1], codes))
     return out
 
 
-# Which local units to report, set via HAILS_PERF_UNITS.
 SYSTEMD_UNITS = parse_units(os.environ.get("HAILS_PERF_UNITS", "caddy.service,docker.service"))
-
-# Which sites to probe over the network. Empty by default, so a fresh install probes nothing.
 HTTP_TARGETS = parse_targets(os.environ.get("HAILS_PERF_TARGETS", ""))
 
-UA = "hails-perf-probe"     # must stay in sync with PROBE_UA in hails-stats-pre.py, which drops these lines
+UA = "hails-perf-probe"     # must stay in sync with PROBE_UA in hails-stats-pre.py, which drops these
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
-    # Do not follow redirects: a 301 or 302 is the healthy answer for some hosts and must be seen.
+    # A 301 or 302 is the healthy answer for some hosts and must be seen, not followed.
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
@@ -449,15 +549,14 @@ def one_request(url, method):
             e.close()
         except Exception:
             pass
-        return e.code                     # a real answer, just not a 2xx
+        return e.code
     except Exception:
-        return 0                          # DNS failure, refused, timeout, TLS error
+        return 0
 
 
 def http_probe(url):
-    """Return (status, latency_ms). status is 0 when the host could not be reached at all.
-
-    HEAD first to skip the body, falling back to GET when the server rejects the method."""
+    """Return (status, latency ms). Status 0 means unreachable. HEAD first, falling back to GET,
+    since some apps answer 405 to HEAD and would look broken."""
     t0 = time.monotonic()
     code = one_request(url, "HEAD")
     if code in (405, 501):
@@ -466,13 +565,14 @@ def http_probe(url):
 
 
 def systemd_states():
-    """Return {unit id: systemctl property dict} using one subprocess for all units."""
+    """One subprocess for all units, not one per unit."""
     out = {}
+    if not SYSTEMD_UNITS:
+        return out
     try:
-        p = subprocess.run(["systemctl", "show", "--no-pager",
-                            "-p", "Id", "-p", "ActiveState", "-p", "SubState",
-                            "-p", "ActiveEnterTimestampMonotonic", "-p", "MemoryCurrent"]
-                           + SYSTEMD_UNITS,
+        p = subprocess.run(["systemctl", "show", "--no-pager", "-p", "Id", "-p", "ActiveState",
+                            "-p", "SubState", "-p", "ActiveEnterTimestampMonotonic",
+                            "-p", "MemoryCurrent"] + SYSTEMD_UNITS,
                            capture_output=True, text=True, timeout=15)
     except Exception as e:
         log("systemctl probe failed: %s" % e)
@@ -498,7 +598,7 @@ def docker_states():
                             "--format", "{{.Names}}\t{{.Status}}\t{{.State}}"],
                            capture_output=True, text=True, timeout=20)
     except Exception:
-        return out                        # docker absent or busy, not fatal
+        return out
     for line in p.stdout.splitlines():
         f = line.split("\t")
         if len(f) >= 3:
@@ -515,7 +615,7 @@ def day_key(ts):
 
 
 class Services(object):
-    """Current service state plus hourly and daily availability history, stored in perf_svc.json."""
+    """Current state plus availability history. Hourly resolution inside 48 hours, daily beyond."""
 
     def __init__(self):
         self.doc = {"since": int(time.time()), "updated": 0, "cur": {}, "hourly": {}, "daily": {}}
@@ -545,10 +645,11 @@ class Services(object):
                     del svc[k]
 
     def prune(self, now):
-        """Forget services that have stopped being probed, so removed units stop rendering as up.
-
-        Three local cycles of grace, so one slow or failed probe round never evicts a live service."""
-        cutoff = now - max(3 * LOCAL_EVERY, 900)
+        """Forget services that stopped being probed, so a deleted container does not keep rendering
+        a green row on the strength of a check that last happened months ago."""
+        # Must allow for the SLOWER of the two probe cadences, or raising HAILS_PERF_HTTP past the
+        # cutoff would prune every http row each pass and take its availability history with it.
+        cutoff = now - max(3 * LOCAL_EVERY, 3 * HTTP_EVERY, 900)
         for name in [n for n, c in self.doc["cur"].items() if c.get("checked", 0) < cutoff]:
             del self.doc["cur"][name]
             for tier in ("hourly", "daily"):
@@ -565,6 +666,7 @@ class Services(object):
             log("service flush failed: %s" % e)
 
 
+# Main loop
 def load_meta():
     try:
         with open(META, "r", encoding="utf-8") as fh:
@@ -573,18 +675,29 @@ def load_meta():
             return m
     except Exception:
         pass
-    return {"schema": SCHEMA, "since": int(time.time()), "heads": {}}
+    return {"schema": SCHEMA, "since": int(time.time()), "heads": {}, "open": {}}
 
 
-def save_meta(meta, rings, open_b=None):
-    meta["heads"] = {k: [r.head, r.count] for k, r in rings.items()}
+def save_meta(meta, series):
+    meta["heads"] = {}
+    meta["open"] = {}
+    for s in series.values():
+        for tier, r in s.rings.items():
+            meta["heads"]["%s_%s" % (s.key, tier)] = [r.head, r.count]
+        for tier, b in s.open_b.items():
+            if b is not None and b.n:
+                meta["open"]["%s_%s" % (s.key, tier)] = b.to_dict()
     meta["updated"] = int(time.time())
-    meta["names"] = NAMES
     meta["interval"] = INTERVAL
-    # Persist the buckets still filling, or a restart loses them: a daily bucket closes only when the
-    # first hour of the next day closes, so a restart in that window would drop a whole day.
-    if open_b is not None:
-        meta["open"] = {k: b.to_dict() for k, b in open_b.items() if b is not None and b.n}
+    # The renderer builds its columns from this, so it follows a hardware change automatically.
+    meta["groups"] = {g: {"metrics": GROUPS[g],
+                          "entities": sorted({s.entity for s in series.values()
+                                              if s.group == g and s.entity is not None})}
+                      for g in GROUPS}
+    # The resolved ring name per entity, so the renderer never has to recompute it and stays right
+    # even when a name clash forced a suffix.
+    meta["keys"] = {"%s|%s" % (s.group, "" if s.entity is None else s.entity): s.key
+                    for s in series.values()}
     tmp = META + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -594,142 +707,130 @@ def save_meta(meta, rings, open_b=None):
         log("meta flush failed: %s" % e)
 
 
+def build_series(meta):
+    """One Series per entity found on the box, restoring head pointers and open buckets from meta."""
+    cores, disks, fs, nics = list_cores(), list_disks(), list_filesystems(), list_nics()
+    wanted = [("sys", None)]
+    wanted += [("cpu", c) for c in cores]
+    wanted += [("disk", d) for d in disks]
+    wanted += [("fs", m) for m, _d in fs]
+    wanted += [("net", n) for n in nics]
+
+    # Two entities can sanitise to the same filename, for example / and /root both becoming "root",
+    # or /mnt/data and /mnt-data both becoming "mnt_data". Sharing a ring file would interleave two
+    # histories and corrupt both, so a clash gets a suffix from a crc of the full name. crc32 and not
+    # hash(), because hash() is salted per process and the suffix has to be the same every restart.
+    series = {}
+    used = set()
+    for group, entity in wanted:
+        key = group if entity is None else "%s_%s" % (group, safe(entity))
+        if key in used:
+            key = "%s_%08x" % (key, zlib.crc32(entity.encode("utf-8")) & 0xffffffff)
+            log("ring name clash for %s, using %s" % (entity, key))
+        used.add(key)
+        s = Series(group, entity, GROUPS[group], key)
+        for tier, _slots, secs in TIERS:
+            # head and count come from Ring.scan, not from meta, so a restart never rewinds.
+            if secs:
+                d = meta.get("open", {}).get("%s_%s" % (s.key, tier))
+                if isinstance(d, dict):
+                    s.open_b[tier] = Bucket.from_dict(d, s.nm)
+        series[(group, entity)] = s
+    return series, cores, disks, fs, nics
+
+
+def cycle(sampler, series, svcs, meta, last):
+    now, vals = sampler.take()
+    if vals:
+        for key, v in vals.items():
+            s = series.get(key)
+            if s is not None and len(v) == s.nm:
+                s.add(now, v)
+
+    if now - last["http"] >= HTTP_EVERY:
+        last["http"] = now
+        for name, url, expect in HTTP_TARGETS:
+            try:
+                code, ms = http_probe(url)
+            except Exception:
+                code, ms = 0, 0.0
+            ok = code in expect
+            svcs.record(name, ok, ms)
+            cur = svcs.doc["cur"].setdefault(name, {})
+            cur.update({"kind": "http", "ok": bool(ok), "code": code,
+                        "ms": round(ms, 1), "checked": int(now)})
+            if ok:
+                cur["last_ok"] = int(now)
+
+    if now - last["local"] >= LOCAL_EVERY:
+        last["local"] = now
+        boot = now - proc_uptime()
+        for unit, st in systemd_states().items():
+            name = unit.replace(".service", "")
+            active = st.get("ActiveState", "") == "active"
+            since = 0
+            try:
+                # Monotonic, so a clock step does not move the reported start time.
+                mono = int(st.get("ActiveEnterTimestampMonotonic", "0"))
+                if mono > 0:
+                    since = int(boot + mono / 1000000.0)
+            except Exception:
+                pass
+            try:
+                mem = int(st.get("MemoryCurrent", "0"))
+            except Exception:
+                mem = 0
+            svcs.doc["cur"][name] = {"kind": "systemd", "ok": active,
+                                     "state": st.get("SubState", st.get("ActiveState", "")),
+                                     "since": since, "mem": mem, "checked": int(now)}
+            svcs.record(name, active, 0.0)
+        for cname, st in docker_states().items():
+            status = st.get("status", "")
+            ok = st.get("state", "") == "running" and "unhealthy" not in status
+            svcs.doc["cur"][cname] = {"kind": "docker", "ok": ok, "state": st.get("state", ""),
+                                      "status": status, "checked": int(now)}
+            svcs.record(cname, ok, 0.0)
+        svcs.doc["uptime"] = int(proc_uptime())
+        svcs.doc["boot"] = int(boot)
+        svcs.prune(now)
+
+    if now - last["svc"] >= SVC_FLUSH:
+        last["svc"] = now
+        svcs.flush()
+    if now - last["meta"] >= 60:
+        last["meta"] = now
+        # Persists the buckets still filling: a daily bucket closes only when the first hour of the
+        # next day closes, so a restart in that window would otherwise drop a whole day.
+        save_meta(meta, series)
+
+
 def main():
     os.makedirs(DIR, exist_ok=True)
     meta = load_meta()
-
-    rings = {}
-    for key, fname, recsz, slots, _ in TIERS:
-        r = Ring(os.path.join(DIR, fname), recsz, slots)
-        h = meta.get("heads", {}).get(key)
-        if h and isinstance(h, list) and len(h) == 2:
-            r.head = h[0] % slots
-            r.count = min(h[1], slots)
-        rings[key] = r
-
-    sampler = Sampler()
+    series, cores, disks, fs, nics = build_series(meta)
+    sampler = Sampler(cores, disks, fs, nics)
     svcs = Services()
-    # One open bucket per rollup tier, restored from the meta file so a restart resumes them.
-    open_b = {key: None for key, _, _, _, secs in TIERS if secs}
-    for key, d in (meta.get("open") or {}).items():
-        if key in open_b and isinstance(d, dict):
-            b = Bucket.from_dict(d)
-            if b is not None:
-                open_b[key] = b
-                log("resumed open %s bucket, n=%d" % (key, b.n))
-
     last = {"http": 0.0, "local": 0.0, "svc": 0.0, "meta": 0.0}
     tick = time.monotonic()
 
-    log("started, dir=%s interval=%.0fs disk=%s nic=%s" % (DIR, INTERVAL, DISK, NIC))
+    log("started, dir=%s interval=%.0fs" % (DIR, INTERVAL))
+    log("hardware: %d cores, disks=%s, filesystems=%s, nics=%s"
+        % (len(cores), ",".join(disks) or "none",
+           ",".join(m for m, _d in fs) or "none", ",".join(nics)))
 
     while True:
         try:
-            cycle(sampler, svcs, rings, open_b, meta, last)
+            cycle(sampler, series, svcs, meta, last)
         except Exception as e:
             # Never die on one bad cycle: with Restart=always a persistent fault would respawn the
             # process every few seconds and reprobe every target each time.
             log("cycle failed: %s" % e)
-        # Sleep to the next tick on an absolute schedule so the cadence does not drift with the work.
         tick += INTERVAL
         gap = tick - time.monotonic()
         if gap < 0:
             tick = time.monotonic()
             gap = 0
         time.sleep(gap)
-
-
-def cycle(sampler, svcs, rings, open_b, meta, last):
-    """Take one sample and run whichever slower probe jobs are due."""
-    now = time.time()
-    if True:
-        v = sampler.take()
-
-        if v is not None:
-            rings["raw"].append(struct.pack(RAW_FMT, int(now), *v))
-            # Cascade the sample up the tiers. Each bucket is keyed on the timestamp of the item
-            # being folded in, never on now, or every hour loses its own last 5 minutes.
-            carry = None
-            for key, _, _, _, secs in TIERS:
-                if not secs:
-                    continue
-                if key == "5m":
-                    item_ts, item = now, v
-                else:
-                    if carry is None:
-                        break                 # nothing closed below, so nothing to fold up
-                    item_ts, item = carry.bid, carry
-                bid = int(item_ts // secs) * secs
-                b = open_b.get(key)
-                closed = None
-                if b is not None and b.bid != bid:
-                    rings[key].append(b.pack())
-                    closed = b
-                    b = None
-                if b is None:
-                    b = Bucket(bid)
-                    open_b[key] = b
-                if key == "5m":
-                    b.add_sample(item)
-                else:
-                    b.add_bucket(item)
-                carry = closed
-
-        # Probes, on their own slower cadences.
-        if now - last["http"] >= HTTP_EVERY:
-            last["http"] = now
-            for name, url, expect in HTTP_TARGETS:
-                try:
-                    code, ms = http_probe(url)
-                except Exception:
-                    code, ms = 0, 0.0
-                ok = code in expect
-                svcs.record(name, ok, ms)
-                cur = svcs.doc["cur"].setdefault(name, {})
-                cur.update({"kind": "http", "ok": bool(ok), "code": code,
-                            "ms": round(ms, 1), "checked": int(now)})
-                if ok:
-                    cur["last_ok"] = int(now)
-
-        if now - last["local"] >= LOCAL_EVERY:
-            last["local"] = now
-            boot = now - proc_uptime()
-            for unit, st in systemd_states().items():
-                name = unit.replace(".service", "")
-                active = st.get("ActiveState", "") == "active"
-                # ActiveEnterTimestampMonotonic is microseconds since boot, unaffected by clock steps.
-                since = 0
-                try:
-                    mono = int(st.get("ActiveEnterTimestampMonotonic", "0"))
-                    if mono > 0:
-                        since = int(boot + mono / 1000000.0)
-                except Exception:
-                    pass
-                mem = 0
-                try:
-                    mem = int(st.get("MemoryCurrent", "0"))
-                except Exception:
-                    pass
-                svcs.doc["cur"][name] = {"kind": "systemd", "ok": active,
-                                         "state": st.get("SubState", st.get("ActiveState", "")),
-                                         "since": since, "mem": mem, "checked": int(now)}
-                svcs.record(name, active, 0.0)
-            for cname, st in docker_states().items():
-                status = st.get("status", "")
-                ok = st.get("state", "") == "running" and "unhealthy" not in status
-                svcs.doc["cur"][cname] = {"kind": "docker", "ok": ok, "state": st.get("state", ""),
-                                          "status": status, "checked": int(now)}
-                svcs.record(cname, ok, 0.0)
-            svcs.doc["uptime"] = int(proc_uptime())
-            svcs.doc["boot"] = int(boot)
-            svcs.prune(now)
-
-        if now - last["svc"] >= SVC_FLUSH:
-            last["svc"] = now
-            svcs.flush()
-        if now - last["meta"] >= 60:
-            last["meta"] = now
-            save_meta(meta, rings, open_b)
 
 
 if __name__ == "__main__":

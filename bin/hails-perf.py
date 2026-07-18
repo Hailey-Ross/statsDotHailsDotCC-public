@@ -3,13 +3,20 @@
 #
 #   python3 hails-perf.py "<TITLE>" "<OUTDIR>"
 #
-# Reads the rings written by hails-perf-collect.py, not the access log and nothing on stdin, and
-# writes perf.html into OUTDIR. Machine wide, so it is generated into the aggregate scope only.
+# Reads the durable rings written by hails-perf-collect.py (NOT the access log, and nothing on
+# stdin) and writes perf.html into OUTDIR. Machine wide, so it is generated once into the aggregate
+# scope only: none of this data is per domain.
 #
-# This page has no Daily/Weekly/Monthly switcher and writes no localStorage key: every metric shows
-# all its windows at once as columns. That also keeps it clear of the shared hailsTimeView key.
+# The shape of the page follows perf_meta.json, which lists the entities the collector found, so a
+# resized box grows a CPU column, a Disk IO card or a Storage card on its own with no edit here.
 #
-# Self contained by repo convention: it carries its own copies of STYLE, FAVICON and hb.
+# No Daily/Weekly/Monthly switcher and no localStorage key: every window is a column and they are all
+# shown at once. That also keeps it clear of the shared hailsTimeView key, which resets to daily on
+# any value it does not recognise.
+#
+# Self contained by repo convention, carrying its own STYLE, FAVICON and helpers.
+#
+# No dash punctuation in page text: commas and colons only.
 import sys, os, json, html, time, struct, calendar
 
 TITLE = sys.argv[1] if len(sys.argv) > 1 else "All domains (aggregate)"
@@ -19,8 +26,11 @@ DIR = os.environ.get("HAILS_PERF_DIR", "/var/lib/hails-stats")
 META = os.path.join(DIR, "perf_meta.json")
 SVCF = os.path.join(DIR, "perf_svc.json")
 
+# Must match TIERS in hails-perf-collect.py. Slot counts only pick a tier, read_ring derives the
+# real record count from the file size.
+TIERS = {"raw": 0, "5m": 300, "1h": 3600, "1d": 86400}
 
-# Format helpers.
+
 def esc(s):
     return html.escape(str(s)) if s not in ("", None) else "(none)"
 
@@ -36,10 +46,6 @@ def hb(n):
 
 def rate(n):
     return hb(n) + "/s"
-
-
-def num(n):
-    return "{:,}".format(int(n))
 
 
 def pct(n):
@@ -69,7 +75,10 @@ def stamp(ts):
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "unknown"
 
 
-# Load the store written by the collector.
+def safe(name):
+    return "".join(c if c.isalnum() else "_" for c in name).strip("_") or "root"
+
+
 def load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -82,100 +91,120 @@ def load_json(path, default):
 MET = load_json(META, {})
 SVC = load_json(SVCF, {})
 SVC_SINCE = SVC.get("since") or 0
-
-NAMES = MET.get("names") or []
-NM = len(NAMES)
-IX = {n: i for i, n in enumerate(NAMES)}
 SINCE = MET.get("since") or 0
 UPDATED = MET.get("updated") or 0
-
-RAW_FMT = "<I" + "f" * NM
-RAW_SZ = struct.calcsize(RAW_FMT) if NM else 0
-AGG_FMT = "<IH" + "f" * (NM * 3)
-AGG_SZ = struct.calcsize(AGG_FMT) if NM else 0
-
-# Must match TIERS in hails-perf-collect.py. The slot counts are only used to pick a tier, since
-# read_ring derives the real count from the file size.
-TIERS = [("raw", "perf_raw.bin", RAW_SZ, 1080, 0),
-         ("5m", "perf_5m.bin", AGG_SZ, 2100, 300),
-         ("1h", "perf_1h.bin", AGG_SZ, 8760, 3600),
-         ("1d", "perf_1d.bin", AGG_SZ, 1825, 86400)]
-
-
-def read_ring(key):
-    """Return records oldest first as (ts, n, sum[], min[], max[]). Raw records become n=1.
-
-    Every slot is scanned and sorted by its own timestamp rather than trusting the meta head
-    pointer, so a stale or missing meta file cannot corrupt the page."""
-    for k, fname, recsz, slots, _ in TIERS:
-        if k != key or not recsz:
-            continue
-        try:
-            with open(os.path.join(DIR, fname), "rb") as fh:
-                buf = fh.read()
-        except Exception:
-            return []
-        out = []
-        for i in range(len(buf) // recsz):
-            rec = buf[i * recsz:(i + 1) * recsz]
-            try:
-                if key == "raw":
-                    f = struct.unpack(RAW_FMT, rec)
-                    if not f[0]:
-                        continue
-                    vals = list(f[1:])
-                    out.append((f[0], 1, vals, vals, vals))
-                else:
-                    f = struct.unpack(AGG_FMT, rec)
-                    if not f[0] or not f[1]:
-                        continue
-                    body = f[2:]
-                    out.append((f[0], f[1], list(body[0:NM]), list(body[NM:NM * 2]),
-                                list(body[NM * 2:NM * 3])))
-            except Exception:
-                continue
-        out.sort(key=lambda r: r[0])
-        return out
-    return []
-
-
-RINGS = {k: read_ring(k) for k, _, _, _, _ in TIERS}
+GROUPS = MET.get("groups") or {}
 NOW = time.time()
 
-# Fall back to the oldest raw sample, not a rollup record: rollups are stamped with their bucket
-# start, which would claim coverage the data does not have and defeat the cold start guard in agg().
+
+def entities(group):
+    return (GROUPS.get(group) or {}).get("entities") or []
+
+
+def metrics(group):
+    return (GROUPS.get(group) or {}).get("metrics") or []
+
+
+KEYS = MET.get("keys") or {}
+
+
+def ring_key(group, entity):
+    """The collector records the resolved ring name, so a name clash that forced a suffix still
+    reads correctly here. The computed form is only a fallback for an older meta file."""
+    k = KEYS.get("%s|%s" % (group, "" if entity is None else entity))
+    return k or (group if entity is None else "%s_%s" % (group, safe(entity)))
+
+
+_CACHE = {}
+
+
+def read_ring(group, entity, tier):
+    """Records oldest first as (ts, n, sum[], min[], max[]). Raw records come back with n of 1.
+
+    Every slot is scanned and sorted by its own timestamp rather than trusting a head pointer, so a
+    stale or missing meta file cannot corrupt the page. Unwritten slots have ts 0 and drop out."""
+    ck = (group, entity, tier)
+    if ck in _CACHE:
+        return _CACHE[ck]
+    nm = len(metrics(group))
+    out = []
+    if nm:
+        raw_fmt = "<I" + "f" * nm
+        agg_fmt = "<IH" + "f" * (nm * 3)
+        fmt = raw_fmt if tier == "raw" else agg_fmt
+        recsz = struct.calcsize(fmt)
+        path = os.path.join(DIR, "perf_%s_%s.bin" % (ring_key(group, entity), tier))
+        try:
+            with open(path, "rb") as fh:
+                buf = fh.read()
+        except Exception:
+            buf = b""
+        for i in range(len(buf) // recsz):
+            try:
+                f = struct.unpack(fmt, buf[i * recsz:(i + 1) * recsz])
+            except Exception:
+                continue
+            if not f[0]:
+                continue
+            if tier == "raw":
+                vals = list(f[1:])
+                out.append((f[0], 1, vals, vals, vals))
+            else:
+                if not f[1]:
+                    continue
+                body = f[2:]
+                out.append((f[0], f[1], list(body[0:nm]), list(body[nm:nm * 2]),
+                            list(body[nm * 2:nm * 3])))
+        out.sort(key=lambda r: r[0])
+    _CACHE[ck] = out
+    return out
+
+
+# The collector records when it first ran. Falling back to the oldest RAW sample rather than a
+# rollup, whose timestamp is its bucket start and would claim coverage the data does not have.
 if not SINCE:
-    SINCE = RINGS["raw"][0][0] if RINGS.get("raw") else 0
+    raw = read_ring("sys", None, "raw")
+    SINCE = raw[0][0] if raw else 0
 
-# The newest raw sample drives the "right now" tiles.
-LATEST = RINGS["raw"][-1] if RINGS["raw"] else None
-
-
-# name: (seconds, tier). Tier is the coarsest ring that still covers the window.
+# name: (seconds, tier). Each tier is the coarsest one that still resolves the window.
 WIN = {"1 min": (60, "raw"), "5 min": (300, "raw"), "15 min": (900, "raw"),
        "30 min": (1800, "raw"), "hour": (3600, "raw"),
        "day": (86400, "5m"), "week": (604800, "5m"),
        "month": (2592000, "1h"), "year": (31536000, "1d")}
 
 
-def agg(metric, wname):
-    """Return (mean, min, max) of one metric over one window, or None if the window is not covered.
+def covered_since(group, entity):
+    """When this entity's own history starts, which is not the same as when the collector first ran.
 
-    None renders as collecting rather than averaging a partial span."""
-    if metric not in IX:
+    A disk or core added months in has empty rings, and judging it by the global start would let a
+    year window average an hour of data and present it as whole. Since hardware can now appear at any
+    time, the guard has to be per entity."""
+    ck = ("since", group, entity)
+    if ck not in _CACHE:
+        oldest = [r[0][0] for r in
+                  (read_ring(group, entity, t) for t in ("1d", "1h", "5m", "raw")) if r]
+        _CACHE[ck] = max(SINCE, min(oldest)) if oldest else 0
+    return _CACHE[ck]
+
+
+def agg(group, entity, metric, wname):
+    """Mean, min and max of one metric over one window, or None when the window is not covered yet.
+
+    None means collecting: the page says so rather than averaging a partial span and presenting it
+    as if it were whole."""
+    names = metrics(group)
+    if metric not in names:
         return None
     secs, tier = WIN[wname]
-    i = IX[metric]
     start = NOW - secs
-    # Cold start: refuse the window if collection began after it started.
-    if not SINCE or SINCE > start + 1:
+    since = covered_since(group, entity)
+    if not since or since > start + 1:
         return None
-    recs = RINGS.get(tier) or []
+    i = names.index(metric)
     tot_n = 0
     tot_sum = 0.0
-    lo = None
-    hi = None
-    for ts, n, sm, mn, mx in recs:
+    lo = hi = None
+    for ts, n, sm, mn, mx in read_ring(group, entity, tier):
         if ts < start or not n:
             continue
         tot_n += n
@@ -187,52 +216,43 @@ def agg(metric, wname):
     return (tot_sum / tot_n, lo, hi)
 
 
-def cell(metric, wname, fmt):
-    a = agg(metric, wname)
-    if a is None:
-        return "<td class=nd>collecting</td>"
-    return "<td>%s</td>" % fmt(a[0])
-
-
-def peak_cell(metric, wname, fmt):
-    a = agg(metric, wname)
-    if a is None:
-        return "<td class=nd>collecting</td>"
-    return "<td>%s</td>" % fmt(a[2])
-
-
-def growth(metric, wname):
-    """Return the signed change across the window, oldest record mean against newest, or None."""
-    if metric not in IX:
+def growth(group, entity, metric, wname):
+    """Signed change across the window, oldest record against newest."""
+    names = metrics(group)
+    if metric not in names:
         return None
     secs, tier = WIN[wname]
-    if not SINCE or SINCE > NOW - secs + 1:
+    since = covered_since(group, entity)
+    if not since or since > NOW - secs + 1:
         return None
-    i = IX[metric]
-    recs = [r for r in (RINGS.get(tier) or []) if r[0] >= NOW - secs and r[1]]
+    i = names.index(metric)
+    recs = [r for r in read_ring(group, entity, tier) if r[0] >= NOW - secs and r[1]]
     if len(recs) < 2:
         return None
     return recs[-1][2][i] / recs[-1][1] - recs[0][2][i] / recs[0][1]
 
 
-def cur(metric):
-    """Return the newest raw reading, or 0.0 for an unknown metric so schema drift degrades one tile
-    instead of raising and leaving no page at all."""
-    if not LATEST or metric not in IX:
+def cur(group, entity, metric):
+    """Newest raw reading, or 0.0 for an unknown metric so a layout change degrades one tile rather
+    than raising and leaving no page at all."""
+    names = metrics(group)
+    if metric not in names:
         return 0.0
-    return LATEST[2][IX[metric]]
+    recs = read_ring(group, entity, "raw")
+    return recs[-1][2][names.index(metric)] if recs else 0.0
 
 
-# Page sections.
 def tile(k, val, sub=""):
     return ("<div class=tile><div class=k>%s</div><div class=val>%s</div>"
             "<div class=d>%s</div></div>" % (esc(k), val, sub))
 
 
-def section(title, note, head, rows):
+def section(title, note, head, rows, sub=None):
     if not rows:
         return ""
     h = ["<h2>%s</h2>" % esc(title)]
+    if sub:
+        h.append("<p class=sub2>%s</p>" % esc(sub))
     if note:
         h.append("<p class=note>%s</p>" % note)
     h.append("<div class=card><div class=tw><table><tr>")
@@ -243,60 +263,70 @@ def section(title, note, head, rows):
     return "".join(h)
 
 
-def win_rows(wins, cols, barmetric=None):
+def win_rows(group, entity, wins, cols, barmetric=None):
     """One row per window, one column per (metric, formatter)."""
-    tops = {}
+    top = 1
     if barmetric:
-        vals = [agg(barmetric, w) for w in wins]
-        tops = max([v[0] for v in vals if v] or [0]) or 1
+        vals = [agg(group, entity, barmetric, w) for w in wins]
+        top = max([v[0] for v in vals if v] or [0]) or 1
     rows = []
     for w in wins:
         b = ""
         if barmetric:
-            a = agg(barmetric, w)
+            a = agg(group, entity, barmetric, w)
             if a:
-                b = bar(a[0] * 100.0 / tops)
-        cells = "".join(f(m, w) for m, f in cols)
-        rows.append("<tr><td class=lbl>%s%s</td>%s</tr>" % (esc(w), b, cells))
+                b = bar(a[0] * 100.0 / top)
+        cells = []
+        for metric, fmt, which in cols:
+            a = agg(group, entity, metric, w)
+            if a is None:
+                cells.append("<td class=nd>collecting</td>")
+            else:
+                cells.append("<td>%s</td>" % fmt(a[which]))
+        rows.append("<tr><td class=lbl>%s%s</td>%s</tr>" % (esc(w), b, "".join(cells)))
     return rows
 
 
-def cpu_cores():
-    return [n for n in NAMES if n.startswith("cpu") and n != "cpu"]
+W4 = ["1 min", "5 min", "15 min", "30 min"]
+W8 = ["1 min", "5 min", "15 min", "30 min", "hour", "day", "week", "month"]
+W7 = ["5 min", "15 min", "30 min", "hour", "day", "week", "month"]
+W4L = ["day", "week", "month", "year"]
+
+MEAN, MIN, MAX = 0, 1, 2
 
 
 def build():
     out = []
+    cores = entities("cpu")
+    disks = entities("disk")
+    fses = entities("fs")
+    nics = entities("net")
+    ncore = max(1, len(cores))
 
-    # KPI tiles, the right now numbers from the newest sample.
+    # Tiles. Disk shows the root filesystem, which is the one people mean by "is it full".
+    root = "/" if "/" in fses else (fses[0] if fses else None)
     uptime = SVC.get("uptime") or 0
     tiles = [tile("VPS uptime", esc(dur(uptime)), "since %s" % esc(stamp(SVC.get("boot"))))]
-    ncore = max(1, len(cpu_cores()))
-    if LATEST:
-        tiles.append(tile("Load", "%.2f" % cur("load1"), "1 min, %d cores" % ncore))
-        tiles.append(tile("CPU", pct(cur("cpu")), "all cores, now"))
-        tiles.append(tile("Memory", pct(cur("mem_pct")),
-                          "%s of %s" % (hb(cur("mem_used")), hb(cur("mem_total") or 0))))
-        swt = cur("swap_total") or 0
-        tiles.append(tile("Swap", hb(cur("swap_used")),
-                          ("of %s" % hb(swt)) if swt else "none configured"))
-        tiles.append(tile("Disk", pct(cur("fs_pct")),
-                          "%s of %s" % (hb(cur("fs_used")), hb(cur("fs_total")))))
-    else:
-        tiles.append(tile("Collector", "no data", "waiting for the first sample"))
+    tiles.append(tile("Load", "%.2f" % cur("sys", None, "load1"), "1 min, %d cores" % ncore))
+    tiles.append(tile("CPU", pct(cur("sys", None, "cpu")), "all cores, now"))
+    tiles.append(tile("Memory", pct(cur("sys", None, "mem_pct")),
+                      "%s of %s" % (hb(cur("sys", None, "mem_used")),
+                                    hb(cur("sys", None, "mem_total")))))
+    swt = cur("sys", None, "swap_total")
+    tiles.append(tile("Swap", hb(cur("sys", None, "swap_used")),
+                      ("of %s" % hb(swt)) if swt else "none configured"))
+    if root:
+        tiles.append(tile("Disk", pct(cur("fs", root, "pct")),
+                          "%s of %s on %s" % (hb(cur("fs", root, "used")),
+                                              hb(cur("fs", root, "total")), esc(root))))
     out.append("<div class=tiles>%s</div>" % "".join(tiles))
-
-    W4 = ["1 min", "5 min", "15 min", "30 min"]
-    W8 = ["1 min", "5 min", "15 min", "30 min", "hour", "day", "week", "month"]
-    W7 = ["5 min", "15 min", "30 min", "hour", "day", "week", "month"]
-    W4L = ["day", "week", "month", "year"]
 
     f2 = lambda v: "%.2f" % v
 
-    # Load.
+    # Load. The kernel keeps 1, 5 and 15 minute averages, so the 30 minute row is our own mean.
     lrows = []
     for w in W4:
-        a = agg("load1", w)
+        a = agg("sys", None, "load1", w)
         if a is None:
             lrows.append("<tr><td class=lbl>%s</td><td class=nd colspan=4>collecting</td></tr>" % esc(w))
             continue
@@ -304,76 +334,87 @@ def build():
                      % (esc(w), bar(a[0] * 100.0 / ncore), f2(a[0]), f2(a[1]), f2(a[2]),
                         f2(a[0] / ncore)))
     out.append(section(
-        "Load average", "Load is runnable plus uninterruptible tasks, so on %d cores a figure of "
-        "%d means fully busy. The kernel keeps only 1, 5 and 15 minute averages, so the 30 minute "
-        "row is a mean over our own samples." % (ncore, ncore),
+        "Load average",
+        "Load is runnable plus uninterruptible tasks, so on %d cores a figure of %d means fully "
+        "busy. The kernel keeps only 1, 5 and 15 minute averages, so the 30 minute row is a mean "
+        "over our own samples." % (ncore, ncore),
         ["Window", "Average", "Minimum", "Peak", "Per core"], lrows))
 
-    # Memory.
     out.append(section(
-        "Memory", "Used is total minus MemAvailable, so cache and reclaimable buffers do not count "
-        "as used. Swap is shown separately because this box already runs with swap in use.",
+        "Memory",
+        "Used is total minus MemAvailable, so cache and reclaimable buffers do not count as used. "
+        "Swap is shown separately because it fills for different reasons.",
         ["Window", "Used", "Used bytes", "Peak used", "Swap used"],
-        win_rows(W4, [("mem_pct", lambda m, w: cell(m, w, pct)),
-                      ("mem_used", lambda m, w: cell(m, w, hb)),
-                      ("mem_pct", lambda m, w: peak_cell(m, w, pct)),
-                      ("swap_used", lambda m, w: cell(m, w, hb))],
+        win_rows("sys", None, W4,
+                 [("mem_pct", pct, MEAN), ("mem_used", hb, MEAN),
+                  ("mem_pct", pct, MAX), ("swap_used", hb, MEAN)],
                  barmetric="mem_pct")))
 
-    # CPU, aggregate plus one column per core, plus steal.
-    cores = cpu_cores()
-    cols = [("cpu", lambda m, w: cell(m, w, pct))]
-    cols += [(c, lambda m, w: cell(m, w, pct)) for c in cores]
-    cols += [("steal", lambda m, w: cell(m, w, pct)),
-             ("iowait", lambda m, w: cell(m, w, pct))]
+    # CPU: the aggregate and steal come from sys, each core from its own ring.
     head = ["Window", "All cores"] + [c.replace("cpu", "Core ") for c in cores] + ["Steal", "IO wait"]
+    crows = []
+    for w in W8:
+        cells = []
+        a = agg("sys", None, "cpu", w)
+        cells.append("<td class=nd>collecting</td>" if a is None else "<td>%s</td>" % pct(a[0]))
+        for c in cores:
+            ca = agg("cpu", c, "busy", w)
+            cells.append("<td class=nd>collecting</td>" if ca is None else "<td>%s</td>" % pct(ca[0]))
+        for m in ("steal", "iowait"):
+            sa = agg("sys", None, m, w)
+            cells.append("<td class=nd>collecting</td>" if sa is None else "<td>%s</td>" % pct(sa[0]))
+        b = bar(a[0]) if a else ""
+        crows.append("<tr><td class=lbl>%s%s</td>%s</tr>" % (esc(w), b, "".join(cells)))
     out.append(section(
-        "CPU usage", "Steal is time the hypervisor gave to another tenant, IO wait is time blocked "
-        "on the disk. Both are counted out of the all cores figure, not into it.",
-        head, win_rows(W8, cols, barmetric="cpu")))
+        "CPU usage",
+        "Steal is time the hypervisor gave to another tenant, IO wait is time blocked on the disk. "
+        "Both are counted out of the all cores figure, not into it. Each core keeps its own history, "
+        "so adding cores does not disturb the rest of this page.",
+        head, crows))
 
-    # Disk IO.
-    out.append(section(
-        "Disk IO", "The one disk on this box, %s. Utilisation is the share of wall clock time the "
-        "disk had at least one request in flight." % esc(os.environ.get("HAILS_PERF_DISK", "vda")),
-        ["Window", "Read", "Write", "IOPS", "Utilisation", "Peak read", "Peak write"],
-        win_rows(W7, [("dsk_read", lambda m, w: cell(m, w, rate)),
-                      ("dsk_write", lambda m, w: cell(m, w, rate)),
-                      ("dsk_iops", lambda m, w: cell(m, w, lambda v: "%.1f" % v)),
-                      ("dsk_util", lambda m, w: cell(m, w, pct)),
-                      ("dsk_read", lambda m, w: peak_cell(m, w, rate)),
-                      ("dsk_write", lambda m, w: peak_cell(m, w, rate))],
-                 barmetric="dsk_util")))
+    # One card per disk, so a new disk simply appears.
+    for dsk in disks:
+        out.append(section(
+            "Disk IO", "Utilisation is the share of wall clock time the disk had at least one "
+            "request in flight.",
+            ["Window", "Read", "Write", "IOPS", "Utilisation", "Peak read", "Peak write"],
+            win_rows("disk", dsk, W7,
+                     [("read", rate, MEAN), ("write", rate, MEAN),
+                      ("iops", lambda v: "%.1f" % v, MEAN), ("util", pct, MEAN),
+                      ("read", rate, MAX), ("write", rate, MAX)],
+                     barmetric="util"),
+            sub=dsk))
 
-    # Network IO.
-    out.append(section(
-        "Network IO", "The WAN interface %s only, excluding docker0, the bridges and the veth pairs. "
-        "This is the real wire total in both directions, so it reads higher than the Bandwidth page, "
-        "which counts response bodies only." % esc(os.environ.get("HAILS_PERF_NIC", "enp1s0")),
-        ["Window", "Inbound", "Outbound", "Peak in", "Peak out"],
-        win_rows(W7, [("net_rx", lambda m, w: cell(m, w, rate)),
-                      ("net_tx", lambda m, w: cell(m, w, rate)),
-                      ("net_rx", lambda m, w: peak_cell(m, w, rate)),
-                      ("net_tx", lambda m, w: peak_cell(m, w, rate))],
-                 barmetric="net_tx")))
+    # One card per interface. The collector only tracks physical NICs, so docker bridges and the
+    # veth pairs that come and go with containers never show up here.
+    for nic in nics:
+        out.append(section(
+            "Network IO", "The real wire total in both directions, so it reads higher than the "
+            "Bandwidth page, which counts response bodies only.",
+            ["Window", "Inbound", "Outbound", "Peak in", "Peak out"],
+            win_rows("net", nic, W7,
+                     [("rx", rate, MEAN), ("tx", rate, MEAN), ("rx", rate, MAX), ("tx", rate, MAX)],
+                     barmetric="tx"),
+            sub=nic))
 
-    # Storage.
-    grows = []
-    for w in W4L:
-        a = agg("fs_used", w)
-        p = agg("fs_pct", w)
-        if a is None or p is None:
-            grows.append("<tr><td class=lbl>%s</td><td class=nd colspan=4>collecting</td></tr>" % esc(w))
-            continue
-        # Signed delta, first reading against last, so reclaimed space reads as negative.
-        g = growth("fs_used", w)
-        gtxt = "collecting" if g is None else ("+" if g >= 0 else "") + hb(abs(g))
-        grows.append("<tr><td class=lbl>%s%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
-                     % (esc(w), bar(p[0]), pct(p[0]), hb(a[0]), hb(a[2]), gtxt))
-    out.append(section(
-        "Storage", "Growth is the change across the window, the first reading against the last, so a "
-        "negative figure means space was reclaimed. Peak is the highest usage seen at any point.",
-        ["Window", "Average used", "Average bytes", "Peak bytes", "Growth"], grows))
+    # One card per filesystem, so a mounted volume starts being tracked on the next restart.
+    for mount in fses:
+        grows = []
+        for w in W4L:
+            a = agg("fs", mount, "used", w)
+            p = agg("fs", mount, "pct", w)
+            if a is None or p is None:
+                grows.append("<tr><td class=lbl>%s</td><td class=nd colspan=4>collecting</td></tr>"
+                             % esc(w))
+                continue
+            g = growth("fs", mount, "used", w)
+            gtxt = "collecting" if g is None else ("+" if g >= 0 else "") + hb(abs(g))
+            grows.append("<tr><td class=lbl>%s%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                         % (esc(w), bar(p[0]), pct(p[0]), hb(a[0]), hb(a[2]), gtxt))
+        out.append(section(
+            "Storage", "Growth is the change across the window, first reading against last, so a "
+            "negative figure means space was reclaimed.",
+            ["Window", "Average used", "Average bytes", "Peak bytes", "Growth"], grows, sub=mount))
 
     out.append(services())
     return "".join(out)
@@ -388,7 +429,7 @@ def bucket_time(key, fmt):
 
 
 def walk(tier, name, fmt, seconds):
-    """Yield the buckets for one service that overlap the span, dropping those that end before it."""
+    """Buckets for one service that overlap the span, so only ones ending before it are dropped."""
     start = NOW - seconds
     width = 3600 if tier == "hourly" else 86400
     for k, b in ((SVC.get(tier) or {}).get(name) or {}).items():
@@ -400,16 +441,11 @@ def walk(tier, name, fmt, seconds):
 
 
 def avail(name, seconds):
-    """Return availability percent over a span, or None when the span is not covered yet.
-
-    Hourly buckets inside 48 hours, daily beyond. The cold start guard stops a young collector
-    reporting a flat 100 percent over 30 days."""
+    """Availability percent over a span, or None when the span is not covered yet. Without that
+    guard a collector up for a minute would report a flat 100 percent over 30 days."""
     if not SVC_SINCE or SVC_SINCE > NOW - seconds + 1:
         return None
-    if seconds <= 172800:
-        tier, fmt = "hourly", "%Y-%m-%dT%H"
-    else:
-        tier, fmt = "daily", "%Y-%m-%d"
+    tier, fmt = ("hourly", "%Y-%m-%dT%H") if seconds <= 172800 else ("daily", "%Y-%m-%d")
     n = ok = 0
     for b in walk(tier, name, fmt, seconds):
         n += b[0]
@@ -430,7 +466,7 @@ def services():
     curd = SVC.get("cur") or {}
     if not curd:
         return ("<h2>Service uptime</h2><div class=card><p class=empty>No service probes on record "
-                "yet. The collector fills this in on its first pass.</p></div>")
+                "yet.</p></div>")
     order = {"systemd": 0, "docker": 1, "http": 2}
     names = sorted(curd.keys(), key=lambda n: (order.get(curd[n].get("kind"), 9), n))
     rows = []
@@ -452,7 +488,7 @@ def services():
             a = avail(n, span)
             cells.append("<td class=nd>collecting</td>" if a is None else
                          "<td class=%s>%s</td>" % ("ok" if a >= 99.5 else "bad", "%.2f%%" % a))
-        # Latency only applies to http rows: local probes have no meaningful measurement.
+        # Latency only means something for the http rows, a zero elsewhere would read as instant.
         lat = latency(n) if kind == "http" else None
         rows.append("<tr><td class=lbl>%s</td><td>%s</td><td class=%s>%s</td><td>%s</td><td>%s</td>"
                     "%s<td>%s</td></tr>"
@@ -469,13 +505,14 @@ def services():
          "Avg latency"], rows)
 
 
-# Assemble and write the page.
 BODY = build()
 
-foot = ("Sampled every %s seconds straight from /proc by hails-perf-collect.py. Averages are true "
-        "means over the window, not point readings, and Peak columns are the highest single sample "
-        "seen in that window."
+foot = ("Sampled every %s seconds straight from /proc. Averages are true means over the window, not "
+        "point readings, and Peak columns are the highest single sample seen in that window."
         % esc(int(MET.get("interval") or 10)))
+foot += ("<br>Hardware is discovered when the collector starts, so new cores, disks, volumes and "
+         "interfaces appear here after a restart. Each one keeps its own history, so an expansion "
+         "does not disturb what is already recorded.")
 if SINCE:
     foot += ("<br>Collection began %s. Windows longer than that read collecting until enough history "
              "exists, and fill in on their own." % esc(stamp(SINCE)))
@@ -485,7 +522,7 @@ else:
 if UPDATED:
     foot += "<br>Collector last wrote %s." % esc(stamp(UPDATED))
     if NOW - UPDATED > 300:
-        foot += (" That is more than 5 minutes ago, so the collector may have stopped.")
+        foot += " That is more than 5 minutes ago, so the collector may have stopped."
 
 FAVICON = ('<link rel="icon" type="image/x-icon" href="data:image/x-icon;base64,AAABAAEAEBAQAAEABAAo'
            'AQAAFgAAACgAAAAQAAAAIAAAAAEABAAAAAAAgAAAAAAAAAAAAAAAEAAAAAAAAADGxsYAWFhYABwcHABfAP8A/9df'
@@ -500,7 +537,7 @@ STYLE = """<style>
 body{font-family:'Roboto',system-ui,sans-serif;min-height:100vh;margin:0;padding:4.4rem 1.2rem 3rem;color:#e8e8f0;background:radial-gradient(1100px 600px at 50% -10%,rgba(111,76,255,.16),transparent 60%),radial-gradient(900px 500px at 88% 6%,rgba(1,110,218,.12),transparent 55%),radial-gradient(800px 480px at 10% 16%,rgba(217,0,192,.08),transparent 55%),#04050c}
 .wrap{max-width:1120px;margin:0 auto}
 h1{font-weight:900;font-size:1.5rem;margin:0 0 1rem}
-h2{font-weight:700;font-size:1.05rem;margin:1.4rem 0 .4rem;color:#cfe0ff}
+h2{font-weight:700;font-size:1.05rem;margin:1.4rem 0 .2rem;color:#cfe0ff}
 a{color:#7aa2f7}
 code{background:rgba(255,255,255,.08);border-radius:4px;padding:1px 5px;font-size:.92em}
 .card{background:rgba(13,14,33,.85);border:1px solid rgba(255,255,255,.09);border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.45);padding:1rem 1.2rem;margin:0 0 1rem}
@@ -517,6 +554,7 @@ td.bad{color:#ff6b8a}
 tr:hover td{background:rgba(111,76,255,.06)}
 .empty{color:rgba(255,255,255,.4);padding:.6rem}
 .note{color:rgba(255,255,255,.42);font-size:.78rem;margin:0 0 .6rem;line-height:1.5}
+.sub2{font:600 .85rem Roboto,system-ui,sans-serif;color:#fff;margin:.1rem 0 .4rem}
 .foot{color:rgba(255,255,255,.42);font-size:.78rem;margin-top:1.2rem;line-height:1.6}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.7rem;margin:0 0 1.2rem}
 .tile{background:rgba(13,14,33,.85);border:1px solid rgba(255,255,255,.09);border-radius:14px;padding:.85rem 1rem}
