@@ -1,12 +1,15 @@
 # Self hosted analytics for Caddy
 
-This is the analytics setup I run for my own sites. It reads Caddy's access log, builds a full
-dashboard plus a dedicated page per panel per domain, and watches the server itself. No JavaScript
-on your visitors, no third party, no cookies, nothing leaves your box. If you already run Caddy,
-you can have this up in about ten minutes.
+Hi! This is the analytics setup I run for my own sites, cleaned up so you can run it for yours.
 
-[GoAccess](https://goaccess.io/) does the log parsing and the chart dashboard. Everything around it
-is Python and shell.
+It reads Caddy's access log and builds a dashboard, a page for every panel on every domain, a
+drilldown on every URL, and a live view of the server itself.
+
+Nothing runs in your visitors' browsers. No tracking script, no cookies, no third party. It is all
+built from the log you are already writing. If you run Caddy, this is about ten minutes of setup.
+
+[GoAccess](https://goaccess.io/) does the log parsing and the chart dashboard. The rest is Python and
+shell.
 
 ## What you get
 
@@ -20,40 +23,74 @@ A landing page listing every domain Caddy serves, and for each one:
 * **Operating Systems** and **Browsers** parsed from the User-Agent
 * **Bandwidth** with daily, weekly, monthly, yearly and all time views
 * **Time Distribution** by hour of day, day of week and week of month
-* **Performance**, an htop style view of the server: load, memory, storage, disk IO, network IO,
-  per core CPU, uptime, and per service uptime, with a card per disk and per volume
+* **Performance**, an htop style view of the server: load, memory, storage, disk IO, network IO, per
+  core CPU, uptime, and per service uptime
 * **Network map**, a diagram of your hosts and what each one proxies to
 
-Optionally it also writes `served.js`, a one line script your public pages can load to show how many
-requests every domain has served in total. It is off unless you configure it.
+Every page has a Domain and a Panel dropdown, so you can hop from "404s on this site" to "404s on that
+one" directly. It is the thing I use most.
 
-Every page has a Domain and a Panel dropdown at the top, so you can jump straight from
-"404s on one site" to "404s on another".
+Most pages have a Daily, Weekly and Monthly switcher, meaning the last 24 hours, 7 days and 30 days,
+and your choice follows you around. Bandwidth is the odd one out: its switcher changes the bucket size
+rather than the window.
 
-Two things worth knowing up front. The GoAccess dashboard counts humans only, since it drops
-crawlers and unknown agents, while the custom pages count all traffic. So the numbers differ on
-purpose. And the Bandwidth page counts response bodies only, so it always reads lower than what your
-host bills you for.
+### Page detail, my favourite bit
+
+Every URL on every panel is a link. Click one and you get a report on that resource:
+
+* **Hits, unique visitors and average response time**, plus entrances and exits where it is a page
+* **Requests over time**, per day
+* **Errors**, with the client and server split, which statuses came back, which referrers dropped
+  visitors onto a failure, and when it first and last happened
+* **404 Not Found**, with the full URL of whoever is still linking to it
+* **Broken links on this page**, the 404s visitors hit straight after it, so the bad link is here
+* **Came from** and **Went to**, the page viewed immediately before and after
+* **Referring URLs**, the exact page that linked in, not just its domain
+* **Status mix**, **Methods**, **Countries** and **Networks**
+
+Sections with nothing to say are hidden rather than drawn empty. Any URL seen at least twice in the
+window gets a record: pages, API endpoints, static assets, even requests that only ever failed.
+Navigation is the exception and comes from page views alone, otherwise every page's next hop would be
+its own CSS.
+
+The drilldown uses the weekly window, so its numbers cover 7 days even when the switcher says Daily.
+
+### Scanners
+
+People are already walking lists of paths at your server looking for `.env` and `wp-login.php`. That
+is normal.
+
+They stay in every count, but they are kept out of the navigation lists where they would drown out
+real journeys. They are spotted structurally, by the redirect a site sends when it bounces an unknown
+path to its homepage, with a short list of known probe paths as backup.
+
+If a whole host is mostly noise, `HAILS_AGG_EXCLUDE` keeps it out of the All domains view while it
+keeps its own per domain pages.
+
+### Numbers that look wrong
+
+**GoAccess counts humans only.** It drops crawlers and unknown agents, while the custom pages count
+all traffic. The two will not agree, on purpose.
+
+**Bandwidth counts response bodies only.** It will always read lower than what your host bills you.
+
+**Time Served is your response time**, not how long anyone read the page. A log cannot tell you that.
 
 ## Before you start
 
-You need:
-
 * A Linux server you can SSH into as root. Debian or Ubuntu is the easy path.
 * **Caddy** already serving your sites.
-* **GoAccess** installed: `apt install goaccess`
-* **Python 3.9 or newer**, already there on any current Debian or Ubuntu.
-* A hostname for the dashboard, with DNS pointing at the server.
+* **GoAccess**: `apt install goaccess`
+* **Python 3.9 or newer**, already on any current Debian or Ubuntu.
+* A hostname for the dashboard, with DNS pointing at your server.
 
-The deploy script installs `python3-maxminddb` and `python3-user-agents` for you, and downloads the
-GeoIP databases.
+The deploy script handles `python3-maxminddb`, `python3-user-agents` and the GeoIP databases.
 
 ## Setting it up
 
 ### 1. Get Caddy logging as JSON
 
-The pipeline reads one access log covering every site. Add this snippet near the top of your
-Caddyfile:
+Near the top of your Caddyfile:
 
 ```
 (access_log) {
@@ -67,17 +104,16 @@ Caddyfile:
 }
 ```
 
-Then put `import access_log` inside each site block you want counted. The full fragment is in
+Then add `import access_log` to each site block you want counted. Full fragment in
 `etc/caddy/access_log.snippet`.
 
-If a CDN sits in front of you, also add the `trusted_proxies` global from
-`etc/caddy/trusted_proxies.global`, otherwise every visitor logs as your CDN and the Visitors panel
-is useless.
+If a CDN sits in front of you, add `trusted_proxies` from `etc/caddy/trusted_proxies.global` too.
+Skip it and every visitor shows up as your CDN.
 
 ### 2. Add the dashboard site block
 
 Copy `etc/caddy/stats.example.com.block` into your Caddyfile and change the hostname. It serves
-`/srv/stats` behind basic auth and proxies `/admin` to the local admin backend.
+`/srv/stats` behind basic auth and proxies `/admin` to the admin backend.
 
 ### 3. Set a password
 
@@ -87,12 +123,9 @@ caddy hash-password --plaintext "$PW" > /root/.stats_bcrypt
 echo "your password is: $PW"
 ```
 
-Write that password down. The deploy script reads the hash from `/root/.stats_bcrypt` and seeds the
-login file from it.
+Write it down before you close the terminal.
 
 ### 4. Deploy
-
-On your own machine:
 
 ```bash
 git clone https://github.com/Hailey-Ross/statsDotHailsDotCC-public.git
@@ -100,28 +133,30 @@ cd statsDotHailsDotCC-public
 cp .env.example .env
 ```
 
-Edit `.env` with your server address, SSH key, dashboard hostname and the login name you want. Then:
+Fill in `.env` with your server address, SSH key, dashboard hostname and login name, then:
 
 ```bash
 bash deploy.sh
 ```
 
-It copies everything over, installs the units, fetches the GeoIP databases, checks your Caddyfile
-for the blocks it needs, and builds the dashboard. It never edits your Caddyfile, it only tells you
-what is missing.
+**It will never edit your Caddyfile**, only tell you what is missing. That file usually fronts every
+other site on your box.
 
 ### 5. Tell it about your server
 
-Edit `/etc/hails-stats/config.env` on the server. That is where you set which disk and interface to
-chart, which services to watch, and which sites to probe for uptime. Every setting is commented in
-`etc/hails-stats/config.example.env`. Then:
+Edit `/etc/hails-stats/config.env`: which disk and interface to chart, which services to watch, which
+sites to probe. Everything is commented in `etc/hails-stats/config.example.env`. Then:
 
 ```bash
 systemctl restart hails-perf
 systemctl start hails-stats.service
 ```
 
-Open your dashboard and you should have reports.
+### 6. More logins, later
+
+The Settings page, behind the gear in the top bar, has an Admin section for adding and removing
+logins. It only touches an isolated auth file, validates, and rolls back on failure, so it cannot take
+your other sites down.
 
 ## How it fits together
 
@@ -138,56 +173,35 @@ Open your dashboard and you should have reports.
         |  rebuilt every 5 minutes by hails-stats.timer
 ```
 
-Separately, `hails-perf-collect.py` runs all the time, sampling `/proc` every 10 seconds so the
-Performance page has real history. It costs under 20 MB of memory and about a hundredth of one core.
+`hails-perf-collect.py` runs continuously, sampling `/proc` every 10 seconds so the Performance page
+has real history. Under 20 MB of memory and about a hundredth of a core.
 
-Almost everything is rebuilt from the raw log every 5 minutes, which means `/srv/stats` is disposable.
-Two things are not, and they live in `/var/lib/hails-stats`:
+`/srv/stats` is rebuilt from the log every 5 minutes and is completely disposable. Two things are not,
+and they live in `/var/lib/hails-stats`:
 
-* `bandwidth.json`, the long term bandwidth history, because your logs roll away in about two months
-  and yearly totals cannot be recovered afterwards
-* `perf_*.bin`, the performance rings, for the same reason
+* `bandwidth.json`, the long term bandwidth history
+* `perf_*.bin`, the performance rings
 
-Do not delete that directory unless you mean to lose the history.
-
-## When you resize the server
-
-The collector looks at the hardware each time it starts, so new cores, disks, volumes and interfaces
-just appear on the page after `systemctl restart hails-perf`.
-
-The part worth knowing is that **your history survives it**. Every countable thing keeps its own ring
-files, so adding a core creates one new set and leaves everything else alone. Your load, memory and
-network history are not disturbed, and neither are the cores you already had. Only genuinely new
-hardware starts from empty, and it says `collecting` until it has enough of its own data to fill a
-window rather than borrowing anyone else's.
-
-Two related habits worth keeping:
-
-* Interfaces are only tracked when they are real hardware, so docker bridges and the `veth` pairs
-  that come and go with containers are ignored. Without that the store would fill with dead files.
-* If you ever edit the metric list in the source, that does change the record width for that group.
-  The old file is moved aside as `.bin.old` and the change is logged rather than being overwritten,
-  so you can still get at the data.
+Your logs roll away in about two months and neither can be reconstructed afterwards, so do not delete
+that directory unless you mean to lose the history.
 
 ## Configuration
 
-Everything machine specific is in `/etc/hails-stats/config.env`. The ones you will actually care
-about:
+Everything machine specific is in `/etc/hails-stats/config.env`:
 
 | Setting | What it does |
 |---|---|
-| `HAILS_PERF_DISK` | Comma separated disks to chart. All of them are found for you, so this is only for pinning the list by hand |
-| `HAILS_PERF_NIC` | Comma separated interfaces. Physical ones are found for you and docker bridges and veths are skipped |
-| `HAILS_PERF_UNITS` | systemd units to show on the Performance page, comma separated |
+| `HAILS_PERF_DISK` | Comma separated disks to chart. Found for you, so this is only for pinning the list by hand |
+| `HAILS_PERF_NIC` | Comma separated interfaces. Physical ones are found for you, docker bridges and veths skipped |
+| `HAILS_PERF_UNITS` | systemd units to show on the Performance page |
 | `HAILS_PERF_TARGETS` | Sites to probe for uptime, as `name\|url\|healthy codes` separated by semicolons |
 | `HAILS_MAP_ORG` | Name shown on the network map |
-| `HAILS_MAP_PUBLIC_HOST` | Set this to also publish a sanitized public copy of the map. Leave it unset and only the private one is built |
-| `HAILS_SERVED_ROOT` | Directory to write `served.js` into for the public requests served counter. Leave it unset and nothing is written |
-| `HAILS_AGG_EXCLUDE` | Hosts to keep out of the All domains view, comma separated, prefix matched. Each still gets its own per domain scope |
+| `HAILS_MAP_PUBLIC_HOST` | Also publish a sanitized public copy of the map. Unset means only the private one |
+| `HAILS_SERVED_ROOT` | Where to write `served.js` for the requests served counter. Unset means nothing is written |
+| `HAILS_AGG_EXCLUDE` | Hosts to keep out of the All domains view, prefix matched. Each keeps its own per domain pages |
 
-The uptime targets need one bit of care. Set the status codes each site really returns, not just
-200. Plenty of healthy sites answer a redirect or an auth challenge on their root, and if you only
-accept 200 they will show as down forever. Check first:
+Set the uptime status codes each site actually returns, not just 200. Plenty of healthy sites answer a
+redirect or an auth challenge on their root and will otherwise look dead forever:
 
 ```bash
 curl -o /dev/null -w '%{http_code}\n' https://your.site/
@@ -195,15 +209,12 @@ curl -o /dev/null -w '%{http_code}\n' https://your.site/
 
 ### Showing a requests served counter on a public page
 
-Set `HAILS_SERVED_ROOT` to a directory your web server already serves and every regen will write
-`served.js` there, so it refreshes every 5 minutes along with the dashboard. The file is a one line
-script with the total
-across every domain, floored to two significant figures so it reads as a headline: 110,800 becomes
-110k. It never rounds up, because the sentence says "Over N".
+Point `HAILS_SERVED_ROOT` at a directory your web server already serves and every rebuild drops
+`served.js` there. It holds the total across all your domains, floored to two significant figures:
+110,800 becomes 110k. It never rounds up.
 
-Give the page an empty element with the id `served` and load the script. The script fills in the
-text and adds the class `on`, which is yours to style, so the counter can fade in rather than appear
-mid layout.
+Give your page an empty element with the id `served` and load the script. It fills in the text and
+adds the class `on`, which is yours to style.
 
 ```html
 <div id="served"></div>
@@ -215,62 +226,85 @@ mid layout.
 #served.on { opacity: 1 }
 ```
 
-If several sites should show the same figure, point `HAILS_SERVED_ROOT` at one shared asset host and
-have every page load that one file. The script is rewritten only when the rounded number actually
-changes, so caches stay valid on the days it does not move.
+Running several sites? Point them all at one shared asset host and they stay in step. The file only
+rewrites itself when the rounded number changes, so caches stay valid.
+
+If your page has no `<meta name="viewport">`, phones lay it out at around 980px and shrink it to fit,
+so 12px text lands at about 5px. Add the tag, which also makes your `max-width` queries work, or size
+the counter in `vw`.
+
+## When you resize the server
+
+New cores, disks, volumes and interfaces appear after `systemctl restart hails-perf`.
+
+**Your history survives it.** Everything countable keeps its own ring files, so adding a core creates
+one new set and leaves the rest alone. Only genuinely new hardware starts empty, and it says
+`collecting` until it has its own data rather than borrowing someone else's.
+
+Docker bridges and `veth` pairs are ignored, otherwise the store fills with dead files. If you edit
+the metric list in the source the record width changes, and the old file is moved aside as `.bin.old`
+rather than overwritten.
 
 ## Adding your own panel
 
-Panels are registered in one place, the `DROP` array near the top of `bin/hails-stats.sh`. Each
-entry is `"Label|key"` and the key is the filename without `.html`. Add an entry, write something
-that produces `<scope dir>/<key>.html`, and it appears in the Panel dropdown everywhere.
+Panels are registered in one place, the `DROP` array near the top of `bin/hails-stats.sh`. Each entry
+is `"Label|key"`, where the key is the filename without `.html`. Add an entry, write something that
+produces `<scope dir>/<key>.html`, and it appears in the Panel dropdown everywhere.
 
-Copy `bin/hails-bandwidth.py` if you want a starting point. Each generator is deliberately self
-contained, carrying its own copy of the style block and helpers rather than importing them, so you
-can change one page without touching the others.
+Copy `bin/hails-bandwidth.py` for a starting point. Each generator is self contained, carrying its own
+style block and helpers, so you can rip one apart without breaking the others.
 
 ## When it goes wrong
 
-**Reports are empty.** Check the log is actually JSON and that the site block has `import access_log`.
-Then run `systemctl start hails-stats.service` and read `journalctl -u hails-stats.service`.
+**Reports are empty.** Check the log is really JSON and the site block has `import access_log`. Then
+`systemctl start hails-stats.service` and read `journalctl -u hails-stats.service`.
 
-**Caddy will not reload, permission denied on the access log.** This one bites everybody.
-`caddy validate` runs as root and creates `/var/log/caddy/access.log` owned by root, and then Caddy,
-running as the caddy user, cannot write to it. Fix it every time after validating:
+**Caddy will not reload, permission denied on the access log.** This one gets everybody. `caddy
+validate` runs as root and creates `/var/log/caddy/access.log` owned by root, so Caddy cannot write to
+its own log. Every time after validating:
 
 ```bash
 chown -R caddy:caddy /var/log/caddy
 systemctl reload caddy
 ```
 
-**Geo and Networks panels are empty.** The GeoIP databases did not download. Run
-`systemctl start hails-geoip.service` and check `/var/lib/GeoIP`.
+Use `reload`, not `restart`. A failed reload keeps the running config so your sites stay up.
 
-**Visitors all show as one IP.** A CDN is in front and you have not set `trusted_proxies`.
+**Geo and Networks are empty.** The GeoIP databases did not download. Run
+`systemctl start hails-geoip.service` and look in `/var/lib/GeoIP`.
 
-**A container shows as unhealthy but the site is fine.** The container's own healthcheck is probably
-wrong rather than the service being down. LinkStack is a known case, see
-`etc/linkstack/docker-compose.yml` for the explanation and the fix.
+**Every visitor is the same IP.** A CDN is in front and `trusted_proxies` is not set.
 
-**Service state looks stale.** systemd and docker are only polled every 5 minutes, so a container you
-just restarted takes a moment to catch up. The `/proc` metrics are 10 seconds fresh.
+**A URL says no detail was recorded.** It needs at least two hits in the last 7 days.
 
-## A note on fonts
+**A container looks unhealthy but the site is fine.** Usually its healthcheck is wrong. LinkStack is a
+known one, see `etc/linkstack/docker-compose.yml`.
 
-Pages load Roboto from Google Fonts, which means each viewer makes one request to Google. That is
-only you and whoever you give logins to, but if you would rather it did not happen, delete the
-`@import` line at the top of `etc/goaccess/custom.css` and the matching one in each generator in
-`bin/`. The font stack falls back to your system font and everything still looks fine.
+**Service state looks stale.** systemd and docker are polled every 5 minutes. The `/proc` metrics are
+10 seconds fresh.
+
+## What is public and what is not
+
+The dashboard is behind basic auth, all of it. Two things can be published on purpose, neither on by
+default:
+
+* the **network map**, with `HAILS_MAP_PUBLIC_HOST`. The public copy drops ports, localhost upstreams,
+  filesystem paths and anything behind auth
+* the **requests served counter**, with `HAILS_SERVED_ROOT`. One rounded number and nothing else
+
+Pages load Roboto from Google Fonts, so each viewer makes one request to Google. That is you and
+whoever you hand logins to, never your visitors. To stop it, delete the `@import` at the top of
+`etc/goaccess/custom.css` and the matching one in each generator in `bin/`.
 
 ## Credits
 
-Built on [GoAccess](https://goaccess.io/) and [Caddy](https://caddyserver.com/), with GeoIP data
-from [DB-IP](https://db-ip.com/). Full list in [CREDITS.md](CREDITS.md).
+Built on [GoAccess](https://goaccess.io/) and [Caddy](https://caddyserver.com/), with GeoIP data from
+[DB-IP](https://db-ip.com/). Full list in [CREDITS.md](CREDITS.md).
 
-If you show the Geo or Networks panels publicly, keep the DB-IP credit visible. It is a condition of
-their licence and it is already in the page footer.
+If you show the Geo or Networks panels publicly, please keep the DB-IP credit visible. It is a
+condition of their licence, and it is already in the page footer.
 
 ## Licence
 
-MIT, see [LICENSE](LICENSE). Do what you like with it. If it saves you an afternoon, that was the
+MIT, see [LICENSE](LICENSE). Do whatever you like with it. If it saves you an afternoon, that was the
 point.
