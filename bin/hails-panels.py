@@ -27,6 +27,7 @@ XPAR = 200        # parents shown on a cross tab panel
 XCHILD = 40       # children shown per cross tab parent
 DETAIL_MIN_HITS = 2   # hits a uri needs in the window before it gets a detail record
 DETAIL_MAX = 5000     # safety ceiling on detail records, busiest kept first
+DETAIL_ROWS = 25      # rows per list on a detail page
 PVCAP = 200000    # per window pageview buffer ceiling (session approximation)
 SAMPCAP = 400     # per uri duration samples for percentiles
 DSAMPCAP = 3000   # per window duration samples for the p95 KPI tile
@@ -188,7 +189,7 @@ FLATKEYS = ["requests", "static", "not_found", "hosts", "mime", "tls", "vhosts",
 
 def new_state():
     return {"flat": {k: {} for k in FLATKEYS}, "xref": {}, "xsite": {}, "xstatus": {}, "xmethod": {},
-            "err": {}, "tnow": {}, "slow": {}, "pv": [], "pv_over": False, "udet": {},
+            "err": {}, "tnow": {}, "slow": {}, "pv": [], "pv_over": False, "udet": {}, "blink": {},
             "vis": set(), "total": 0, "err_n": 0, "bytes": 0, "page": 0,
             "durs": 0, "durn": 0, "dsamp": [], "dsamp_n": 0, "last": {}, "visits": 0}
 
@@ -293,7 +294,7 @@ for line in sys.stdin:
         if not ok and uri:
             e = S["err"].get(uri)
             if e is None and len(S["err"]) < ACC_CAP:
-                e = S["err"][uri] = {"c4": 0, "c5": 0, "total": 0, "st": {}, "ref": {},
+                e = S["err"][uri] = {"c4": 0, "c5": 0, "total": 0, "st": {}, "ref": {}, "nfref": {},
                                      "first": ts, "last": ts, "vis": set()}
             if e is not None:
                 e["total"] += 1
@@ -304,6 +305,10 @@ for line in sys.stdin:
                 e["st"][st] = e["st"].get(st, 0) + 1
                 if extref:
                     e["ref"][extref] = e["ref"].get(extref, 0) + 1
+                # 404s get their own full referrer list. e["ref"] cannot serve this: it is netloc
+                # only and pools every error status, so it cannot say who links to a missing page.
+                if st == 404 and ref and len(e["nfref"]) < XCHILD_CAP:
+                    e["nfref"][ref] = e["nfref"].get(ref, 0) + 1
                 e["first"] = min(e["first"], ts)
                 e["last"] = max(e["last"], ts)
                 if ip:
@@ -324,7 +329,7 @@ for line in sys.stdin:
             ud = S["udet"].get(uri)
             if ud is None and len(S["udet"]) < ACC_CAP:
                 ud = S["udet"][uri] = {"hits": 0, "vis": set(), "st": {}, "meth": {}, "ctry": {},
-                                       "durs": 0, "durn": 0}
+                                       "asn": {}, "refs": {}, "days": {}, "durs": 0, "durn": 0}
             if ud is not None:
                 ud["hits"] += 1
                 if ip:
@@ -334,9 +339,31 @@ for line in sys.stdin:
                     ud["meth"][method] = ud["meth"].get(method, 0) + 1
                 if country:
                     ud["ctry"][country] = ud["ctry"].get(country, 0) + 1
+                if network:
+                    ud["asn"][network] = ud["asn"].get(network, 0) + 1
+                # the full referring url, not just its host: the netloc alone cannot tell you which
+                # page linked in, which is the thing you want to go and fix
+                if ref and len(ud["refs"]) < XCHILD_CAP:
+                    ud["refs"][ref] = ud["refs"].get(ref, 0) + 1
+                ud["days"][day] = ud["days"].get(day, 0) + 1
                 if du > 0:
                     ud["durs"] += du
                     ud["durn"] += 1
+
+        # Broken links, keyed by the page the link sits ON rather than the missing target. Built from
+        # the Referer header, not the session walk: a 404 fails the ok test so it never reaches the
+        # session buffer, and the header states outright which page carried the link.
+        if uri and st == 404 and ref and netloc:
+            path = urlsplit(ref).path or "/"
+            # detail keys are host prefixed in the aggregate scope and path only per domain, so the
+            # referring key must be built the same way or this card never resolves. Aggregate uris
+            # never start with a slash, which is the discriminator.
+            src = path if uri.startswith("/") else (netloc + path)
+            bl = S["blink"].get(src)
+            if bl is None and len(S["blink"]) < ACC_CAP:
+                bl = S["blink"][src] = {}
+            if bl is not None and len(bl) < XCHILD_CAP:
+                bl[uri] = bl.get(uri, 0) + 1
 
         if uri and du > 0:
             sl = S["slow"].get(uri)
@@ -978,6 +1005,8 @@ def build_detail_json():
     udet = CUR["weekly"]["udet"]
     if not udet:
         return out
+    errs = CUR["weekly"]["err"]
+    blinks = CUR["weekly"]["blink"]
     ranked = sorted(udet.items(), key=lambda kv: kv[1]["hits"], reverse=True)
     for uri, u in ranked[:DETAIL_MAX]:
         if u["hits"] < DETAIL_MIN_HITS:
@@ -989,15 +1018,43 @@ def build_detail_json():
             "entries": d["entries"] if d else 0,
             "exits": d["exits"] if d else 0,
             "avgms": avg,
-            "prev": [[str(k), v] for k, v in top(d["prev"], 8)] if d else [],
-            "next": [[str(k), v] for k, v in top(d["next"], 8)] if d else [],
-            "ext": [[str(k), v] for k, v in top(d["ext"], 8)] if d else [],
-            "st": [["%s %s" % (k, reason(k)), v] for k, v in top(u["st"], 8)],
-            "meth": [[str(k), v] for k, v in top(u["meth"], 8)],
-            "ctry": [[str(k), v] for k, v in top(u["ctry"], 8)],
+            "prev": [[str(k), v] for k, v in top(d["prev"], DETAIL_ROWS)] if d else [],
+            "next": [[str(k), v] for k, v in top(d["next"], DETAIL_ROWS)] if d else [],
+            "ext": [[str(k), v] for k, v in top(d["ext"], DETAIL_ROWS)] if d else [],
+            "st": [["%s %s" % (k, reason(k)), v] for k, v in top(u["st"], DETAIL_ROWS)],
+            "meth": [[str(k), v] for k, v in top(u["meth"], DETAIL_ROWS)],
+            "ctry": [[str(k), v] for k, v in top(u["ctry"], DETAIL_ROWS)],
         }
         # lets the page hide the navigation section rather than drawing empty cards
         rec["nav"] = 1 if (rec["prev"] or rec["next"] or rec["ext"]) else 0
+
+        # Everything below is omitted when empty rather than written as an empty list. That is what
+        # keeps the file a sane size: most uris have no errors and no referrer, and this is written
+        # for every scope on every regen.
+        if u["asn"]:
+            rec["asn"] = [[str(k), v] for k, v in top(u["asn"], DETAIL_ROWS)]
+        if u["refs"]:
+            rec["refs"] = [[str(k), v] for k, v in top(u["refs"], DETAIL_ROWS)]
+        if u["days"]:
+            rec["days"] = sorted([[k, v] for k, v in u["days"].items()])
+
+        e = errs.get(uri)
+        if e and e["total"]:
+            rec["err"] = {
+                "total": e["total"], "c4": e["c4"], "c5": e["c5"], "uv": len(e["vis"]),
+                "st": [["%s %s" % (k, reason(k)), v] for k, v in top(e["st"], DETAIL_ROWS)],
+                "ref": [[str(k), v] for k, v in top(e["ref"], DETAIL_ROWS)],
+                "first": when(e["first"]), "last": when(e["last"]),
+            }
+            n404 = e["st"].get(404, 0)
+            if n404:
+                rec["nf"] = {"hits": n404,
+                             "refs": [[str(k), v] for k, v in top(e["nfref"], DETAIL_ROWS)]}
+
+        bl = blinks.get(uri)
+        if bl:
+            rec["blink"] = [[str(k), v] for k, v in top(bl, DETAIL_ROWS)]
+
         out[uri] = rec
     return out
 
@@ -1013,10 +1070,22 @@ __STYLE__
 </div>
 <script>
 function esc(s){return String(s).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
-function list(title,arr){var r='<div class=card><h2 style="margin-top:0">'+title+'</h2>';
+// Every list carries a line saying what it counts. A bare heading leaves you guessing whether a
+// number is hits, visitors or sessions.
+function list(title,arr,note){var r='<div class=card><h2 style="margin-top:0">'+title+'</h2>';
+if(note){r+='<p class=foot style="margin:-6px 0 10px">'+note+'</p>';}
 if(!arr||!arr.length){return r+'<div class=empty>None.</div></div>';}
-r+='<div class=tw><table><tbody>';arr.forEach(function(x){r+='<tr><td class=lbl><span class=v>'+esc(x[0])+'</span></td><td>'+x[1]+'</td></tr>';});
+var tot=0;arr.forEach(function(x){tot+=x[1];});
+var mx=arr[0][1]||1;
+r+='<div class=tw><table><tbody>';
+arr.forEach(function(x){
+  var pct=Math.round(1000*x[1]/tot)/10;
+  r+='<tr><td class=lbl><span class=v>'+esc(x[0])+'</span>'
+    +'<span class=bar style="width:'+Math.round(100*x[1]/mx)+'%"></span></td>'
+    +'<td>'+x[1]+'</td><td class=foot>'+pct+'%</td></tr>';});
 return r+'</tbody></table></div></div>';}
+// hidden entirely when there is nothing to show, rather than rendering an empty card
+function opt(title,arr,note){return (arr&&arr.length)?list(title,arr,note):'';}
 var PAGES=null;
 function render(){
 var el=document.getElementById('body');
@@ -1027,16 +1096,61 @@ document.querySelector('h1').textContent=uri;
 var d=PAGES?PAGES[uri]:null;
 if(!d){ft.style.display='none';el.innerHTML='<div class=card><div class=empty>No detail recorded for this URL. A URL needs at least two hits in the last 7 days to get a record.</div></div>';return;}
 ft.style.display=d.nav?'':'none';
+var e=d.err;
 var tiles='<div class=tiles>'
 +'<div class=tile><div class=k>Hits</div><div class=val>'+d.pv+'</div></div>'
-+'<div class=tile><div class=k>Unique</div><div class=val>'+d.uv+'</div></div>';
++'<div class=tile><div class=k>Unique Visitors</div><div class=val>'+d.uv+'</div></div>';
 if(d.nav){tiles+='<div class=tile><div class=k>Entrances</div><div class=val>'+d.entries+'</div></div>'
 +'<div class=tile><div class=k>Exits</div><div class=val>'+d.exits+'</div></div>';}
-tiles+='<div class=tile><div class=k>Avg Response</div><div class=val>'+d.avgms+' ms</div></div></div>';
+tiles+='<div class=tile><div class=k>Avg Response</div><div class=val>'+d.avgms+' ms</div></div>';
+if(e){tiles+='<div class=tile><div class=k>Failed</div><div class=val class=bad>'+e.total+'</div></div>';}
+tiles+='</div>';
+
+var out=tiles;
+
+// Activity first: it frames everything below by showing when the traffic actually happened.
+if(d.days&&d.days.length){
+  var dm=0;d.days.forEach(function(x){if(x[1]>dm)dm=x[1];});
+  var rows='';
+  d.days.forEach(function(x){rows+='<tr><td class=lbl><span class=v>'+esc(x[0])+'</span>'
+    +'<span class=bar style="width:'+Math.round(100*x[1]/(dm||1))+'%"></span></td><td>'+x[1]+'</td></tr>';});
+  out+='<div class=card><h2 style="margin-top:0">Requests over time</h2>'
+    +'<p class=foot style="margin:-6px 0 10px">Requests per day across the window, all traffic.</p>'
+    +'<div class=tw><table><tbody>'+rows+'</tbody></table></div></div>';
+}
+
+// Failures, then the two 404 cards, each hidden when it has nothing to say.
+if(e){
+  out+='<div class=card><h2 style="margin-top:0">Errors</h2>'
+    +'<p class=foot style="margin:-6px 0 10px">Every failed request for this URL, status 400 and above. '
+    +e.total+' failed, '+e.c4+' client (4xx) and '+e.c5+' server (5xx), affecting '+e.uv+' unique visitors. '
+    +'First seen '+esc(e.first)+', last seen '+esc(e.last)+'.</p></div>';
+  out+='<div class=grid2>'
+    +opt('Failure statuses',e.st,'Which failures, and how often each.')
+    +opt('Referrers that hit errors',e.ref,'External sites whose visitors landed on a failure here.')
+    +'</div>';
+}
+if(d.nf){
+  out+='<div class=card><h2 style="margin-top:0">404 Not Found</h2>'
+    +'<p class=foot style="margin:-6px 0 10px">This URL was requested and did not exist, '+d.nf.hits+' times. '
+    +'The list below is who is still linking to it.</p></div>';
+  out+='<div class=grid2>'+opt('Linked from',d.nf.refs,'Full referring URL, so you can go and fix the link.')+'</div>';
+}
+out+='<div class=grid2>'
+  +opt('Broken links on this page',d.blink,'404s that visitors reached directly from this page, so the bad link is here.')
+  +'</div>';
+
 var grid='<div class=grid2>';
-if(d.nav){grid+=list('Came from (internal)',d.prev)+list('Went to (internal)',d.next)+list('External referrers',d.ext);}
-grid+=list('Status mix',d.st)+list('Methods',d.meth)+list('Countries',d.ctry)+'</div>';
-el.innerHTML=tiles+grid;}
+if(d.nav){grid+=list('Came from (internal)',d.prev,'The page viewed immediately before this one, in the same session.')
++list('Went to (internal)',d.next,'The page viewed immediately after this one, in the same session.')
++list('External referrers',d.ext,'Outside sites that sent traffic here, by domain.');}
+grid+=opt('Referring URLs',d.refs,'The exact page that linked here, full URL including internal links.')
++list('Status mix',d.st,'Every response status returned for this URL.')
++list('Methods',d.meth,'HTTP methods used against this URL.')
++list('Countries',d.ctry,'Where the requests came from, by country of the client IP.')
++opt('Networks',d.asn,'The network or provider each request came from.')
++'</div>';
+el.innerHTML=out+grid;}
 fetch('detail.json').then(function(r){return r.json();}).then(function(res){PAGES=res.pages||{};render();})
 .catch(function(e){document.getElementById('body').innerHTML='<div class=card><div class=empty>Could not load detail data.</div></div>';});
 window.addEventListener('hashchange',render);
