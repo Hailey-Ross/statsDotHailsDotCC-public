@@ -3,9 +3,9 @@
 # Totals the hits field across every host and every day in the bandwidth rollup and writes the
 # sentence "Over N requests served" into served.js, which any public page can load to display it.
 # Reads no stdin and never touches the raw access log, like hails-bandwidth.py.
-# Driven by hails-served.timer at 00:00 UTC daily, not by hails-stats.sh: the figure is a headline,
-# so it ticks over once a day rather than every 5 minutes. The rollup is refreshed every 5 minutes
-# regardless, so the number is current whenever this runs.
+# Driven by hails-served.timer every 6 hours from 00:00 UTC, not by hails-stats.sh: the figure is a
+# headline, so it steps at a readable pace rather than every 5 minutes. The rollup is refreshed every
+# 5 minutes regardless, so the number is current whenever this runs.
 # Rounding floors to two significant figures, never to nearest: the sentence says "Over N", so it
 # must not claim more traffic than actually happened. 110,800 renders as 110k.
 # Writes only when the rendered text changes, so browser and proxy caches stay valid on the days the
