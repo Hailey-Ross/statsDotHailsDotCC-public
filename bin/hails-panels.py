@@ -9,7 +9,7 @@
 # window switcher. Counts all traffic including bots.
 # Sessions, visits, entries and exits are inferred from client IP plus timestamp gaps, so they
 # are approximate, not beacon accurate.
-import sys, json, html, os, time, math, random
+import sys, json, html, os, time, math, random, re
 from urllib.parse import urlsplit, quote
 
 TITLE = sys.argv[1] if len(sys.argv) > 1 else "All domains (aggregate)"
@@ -120,6 +120,25 @@ def os_browser(ua_str):
 
 def is_static(uri):
     return uri.split("?", 1)[0].lower().endswith(STATIC)
+
+
+# Vulnerability scanner probes. These are real traffic and stay in every count and every panel: they
+# are only kept out of the NAVIGATION lists, where a scanner walking a list of paths is noise rather
+# than a visitor browsing the site.
+#
+# Anchored to path segments and deliberately free of broad words. An earlier draft matched "backup"
+# and swallowed a busy real endpoint at /api/admin/backups/log/. Match on a segment boundary, never
+# on a substring anywhere in the path.
+PROBE_RE = re.compile(
+    r"(?:^|/)(?:\.env|\.git/|\.svn/|\.aws/|\.ssh/|\.DS_Store"
+    r"|phpinfo\.php|php-info\.php|phpversion\.php|php\.php|i\.php|info\.php|test\.php"
+    r"|shell\.php|eval-stdin\.php|adminer\.php|phpmyadmin"
+    r"|xmlrpc\.php|wp-config\.php|wp-login\.php|wp-admin/|wp-includes/)"
+    r"|rest_route=/wp/", re.I)
+
+
+def is_probe(uri):
+    return bool(PROBE_RE.search(uri))
 
 
 # ---- accumulators -------------------------------------------------------------------------------
@@ -353,7 +372,9 @@ for line in sys.stdin:
         # Broken links, keyed by the page the link sits ON rather than the missing target. Built from
         # the Referer header, not the session walk: a 404 fails the ok test so it never reaches the
         # session buffer, and the header states outright which page carried the link.
-        if uri and st == 404 and ref and netloc:
+        # Probes excluded: a scanner requesting .env with a spoofed Referer is not a broken link on
+        # the page it claims to come from.
+        if uri and st == 404 and ref and netloc and not is_probe(uri):
             path = urlsplit(ref).path or "/"
             # detail keys are host prefixed in the aggregate scope and path only per domain, so the
             # referring key must be built the same way or this card never resolves. Aggregate uris
@@ -471,11 +492,18 @@ def walk_sessions(events, want_detail):
                 ex["vis"].add(pages[-1][0])
         if detail is not None:
             # Adjacency spans the whole session, so an API call records the page that preceded it.
+            # Edges touching a scanner probe are dropped: a scanner working through a path list is
+            # not navigation, and it otherwise fills every busy page's next hop list. The probe
+            # still gets its own record and still counts everywhere else, it simply links nowhere.
+            # Dropped at the edge rather than by leaving probes out of the session buffer, so that
+            # session segmentation, and therefore Entry and Exit pages, are completely unaffected.
             for i, e in enumerate(sess):
                 u = e[2]
                 rec_uri_agg(u, e)
                 if i > 0:
                     pu = sess[i - 1][2]
+                    if is_probe(u) or is_probe(pu):
+                        continue
                     detail[u]["prev"][pu] = detail[u]["prev"].get(pu, 0) + 1
                     detail[pu]["next"][u] = detail[pu]["next"].get(u, 0) + 1
             # Entrances and exits stay page based, so they agree with the Entry/Exit panel.
