@@ -16,6 +16,28 @@ TMP=$(mktemp); cat $LOGS | python3 "$PRE" > "$TMP"
 # Aggregate variant: same data with the host prefixed onto each uri, so aggregate URL panels show
 # which domain each row is for. Per domain scopes use the clean $TMP instead.
 AGGLOG=$(mktemp); cat $LOGS | python3 "$PRE" --prefix-host > "$AGGLOG"
+
+# systemd passes the config in from /etc/hails-stats/config.env via EnvironmentFile, but a manual run
+# of this script gets no such thing. Read single keys out rather than sourcing the file: config.env
+# holds unquoted values containing pipes and parentheses that a shell must never evaluate.
+cfg(){ sed -n "s/^[[:space:]]*$1=//p" /etc/hails-stats/config.env 2>/dev/null | tail -1; }
+: "${HAILS_AGG_EXCLUDE:=$(cfg HAILS_AGG_EXCLUDE)}"
+
+# Hosts kept out of the AGGREGATE view only, comma separated, matched as a prefix of the hostname.
+# Each one still gets its own per domain scope, built from $TMP below, so it can be inspected
+# deliberately from the Domain dropdown. Useful for a host whose traffic is mostly noise, such as a
+# url shortener that vulnerability scanners hammer, which would otherwise skew every aggregate panel.
+if [ -n "$HAILS_AGG_EXCLUDE" ]; then
+  AGGTMP=$(mktemp)
+  IFS=',' read -ra AGGPATS <<< "$HAILS_AGG_EXCLUDE"
+  for p in "${AGGPATS[@]}"; do
+    p="${p// /}"
+    [ -z "$p" ] && continue
+    grep -v "\"host\": \"$p" "$AGGLOG" > "$AGGTMP" || true
+    cat "$AGGTMP" > "$AGGLOG"
+  done
+  rm -f "$AGGTMP"
+fi
 SCOPELOG=$(mktemp)
 
 # GoAccess renders only the chart dashboard; every dedicated panel page comes from hails-panels.py,
@@ -110,14 +132,9 @@ python3 "$ROLLUP" < "$TMP"
 # every regen costs a read and a compare on the runs where nothing moved. Fully guarded: the counter
 # must never be able to fail the dashboard rebuild.
 #
-# systemd passes HAILS_SERVED_ROOT in from /etc/hails-stats/config.env via EnvironmentFile, but a
-# manual run of this script gets no such thing. Pull just that one key out rather than sourcing the
-# file: config.env holds unquoted values containing pipes and parentheses that a shell must never
-# evaluate.
-if [ -z "${HAILS_SERVED_ROOT:-}" ] && [ -r /etc/hails-stats/config.env ]; then
-  HAILS_SERVED_ROOT=$(sed -n 's/^[[:space:]]*HAILS_SERVED_ROOT=//p' /etc/hails-stats/config.env | tail -1)
-  export HAILS_SERVED_ROOT
-fi
+# Read from config.env when systemd has not supplied it, see cfg() above.
+: "${HAILS_SERVED_ROOT:=$(cfg HAILS_SERVED_ROOT)}"
+export HAILS_SERVED_ROOT
 python3 "$SERVEDGEN" >/dev/null 2>&1 || true
 
 gen_scope "$STATS/all" "All domains (aggregate)" "$AGGLOG" "all"

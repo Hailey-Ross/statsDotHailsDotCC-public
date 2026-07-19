@@ -183,6 +183,7 @@ about:
 | `HAILS_MAP_ORG` | Name shown on the network map |
 | `HAILS_MAP_PUBLIC_HOST` | Set this to also publish a sanitized public copy of the map. Leave it unset and only the private one is built |
 | `HAILS_SERVED_ROOT` | Directory to write `served.js` into for the public requests served counter. Leave it unset and nothing is written |
+| `HAILS_AGG_EXCLUDE` | Hosts to keep out of the All domains view, comma separated, prefix matched. Each still gets its own per domain scope |
 
 The uptime targets need one bit of care. Set the status codes each site really returns, not just
 200. Plenty of healthy sites answer a redirect or an auth challenge on their root, and if you only
