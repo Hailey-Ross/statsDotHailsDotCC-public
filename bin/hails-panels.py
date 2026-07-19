@@ -259,6 +259,9 @@ for line in sys.stdin:
     ct = rh.get("Content-Type")
     ct = (ct[0] if isinstance(ct, list) and ct else ct) if not isinstance(ct, str) else ct
     ct = ct.split(";", 1)[0].strip() if ct else ""
+    loc = rh.get("Location")
+    loc = (loc[0] if isinstance(loc, list) and loc else loc) if not isinstance(loc, str) else loc
+    loc = loc or ""
     tls = (req.get("tls") or {}).get("version") or ""
     ua = hdrs.get("User-Agent")
     ua = (ua[0] if isinstance(ua, list) and ua else ua) if not isinstance(ua, str) else ua
@@ -287,6 +290,31 @@ for line in sys.stdin:
     day = time.strftime("%Y-%m-%d", time.localtime(ts))
     pageview = (not static) and ok and (ct.startswith("text/html") or ct == "")
     navable = (not static) and ok   # joins the session walk so APIs get navigation, pageview or not
+
+    # A catch all redirect: a 3xx whose Location is a bare origin, sent for a path that is not the
+    # root. That is a site bouncing an unknown path to its homepage, which is what a URL shortener
+    # does with a slug it does not recognise, and it is not navigation.
+    #
+    # This is the structural way to spot a scanner without a list of paths to guess at. A scanner
+    # walks a list of urls, every one is unknown, every one bounces to the homepage, and because the
+    # visitor genuinely does arrive at the homepage next it manufactures real looking journeys into
+    # the front page.
+    #
+    # Two conditions keep it honest. Requiring a Location leaves 304 Not Modified alone, which is a
+    # real cached page view. Requiring the path to not be the root spares whole domain redirects,
+    # which are legitimate arrival paths worth seeing.
+    catchall = False
+    if 300 <= st < 400 and loc:
+        lp = urlsplit(loc)
+        # The aggregate scope carries a host prefix on the uri (example.com/), so the path has to be
+        # taken off the front rather than parsed out with urlsplit, which would treat the whole
+        # string as a path and see the root as a non root path. Aggregate uris never start with a
+        # slash, which is the discriminator.
+        rp = uri.split("?", 1)[0]
+        if not rp.startswith("/"):
+            i = rp.find("/")
+            rp = rp[i:] if i >= 0 else "/"
+        catchall = lp.path in ("", "/") and not lp.query and rp not in ("", "/")
 
     for w in cw:
         S = CUR[w]
@@ -421,7 +449,7 @@ for line in sys.stdin:
                     S["pv_over"] = True
                 else:
                     S["pv"].append((ip, ts, uri, extref, country, st, method, du,
-                                    1 if pageview else 0))
+                                    1 if pageview else 0, 1 if catchall else 0))
 
     for w in pw:
         P = PRV[w]
@@ -501,8 +529,12 @@ def walk_sessions(events, want_detail):
                 u = e[2]
                 rec_uri_agg(u, e)
                 if i > 0:
-                    pu = sess[i - 1][2]
-                    if is_probe(u) or is_probe(pu):
+                    pe = sess[i - 1]
+                    pu = pe[2]
+                    # e[9] is the structural test and does the heavy lifting with no upkeep.
+                    # is_probe is the backstop for the case it cannot see: a redirect that PRESERVES
+                    # the path, such as www to apex, where the Location is not a bare origin.
+                    if e[9] or pe[9] or is_probe(u) or is_probe(pu):
                         continue
                     detail[u]["prev"][pu] = detail[u]["prev"].get(pu, 0) + 1
                     detail[pu]["next"][u] = detail[pu]["next"].get(u, 0) + 1
