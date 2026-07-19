@@ -25,7 +25,8 @@ WLABEL = {"daily": "last 24 hours", "weekly": "last 7 days", "monthly": "last 30
 FLATCAP = 500     # rows shown on a flat panel
 XPAR = 200        # parents shown on a cross tab panel
 XCHILD = 40       # children shown per cross tab parent
-DETAIL_TOP = 150  # uris that get a per page detail record
+DETAIL_MIN_HITS = 2   # hits a uri needs in the window before it gets a detail record
+DETAIL_MAX = 5000     # safety ceiling on detail records, busiest kept first
 PVCAP = 200000    # per window pageview buffer ceiling (session approximation)
 SAMPCAP = 400     # per uri duration samples for percentiles
 DSAMPCAP = 3000   # per window duration samples for the p95 KPI tile
@@ -187,7 +188,7 @@ FLATKEYS = ["requests", "static", "not_found", "hosts", "mime", "tls", "vhosts",
 
 def new_state():
     return {"flat": {k: {} for k in FLATKEYS}, "xref": {}, "xsite": {}, "xstatus": {}, "xmethod": {},
-            "err": {}, "tnow": {}, "slow": {}, "pv": [], "pv_over": False,
+            "err": {}, "tnow": {}, "slow": {}, "pv": [], "pv_over": False, "udet": {},
             "vis": set(), "total": 0, "err_n": 0, "bytes": 0, "page": 0,
             "durs": 0, "durn": 0, "dsamp": [], "dsamp_n": 0, "last": {}, "visits": 0}
 
@@ -314,6 +315,28 @@ for line in sys.stdin:
                 t["h"] += 1
                 if ip:
                     t["vis"].add(ip)
+        # Per uri statistics for the detail drilldown, over every request: any method, any status,
+        # any content type, static included. Kept separate from the pageview buffer above, which
+        # stays narrow because it also feeds Entry/Exit pages. Being a plain dict rather than a per
+        # event buffer, it also needs no session ordering and cannot hit PVCAP.
+        if uri:
+            ud = S["udet"].get(uri)
+            if ud is None and len(S["udet"]) < ACC_CAP:
+                ud = S["udet"][uri] = {"hits": 0, "vis": set(), "st": {}, "meth": {}, "ctry": {},
+                                       "durs": 0, "durn": 0}
+            if ud is not None:
+                ud["hits"] += 1
+                if ip:
+                    ud["vis"].add(ip)
+                ud["st"][st] = ud["st"].get(st, 0) + 1
+                if method:
+                    ud["meth"][method] = ud["meth"].get(method, 0) + 1
+                if country:
+                    ud["ctry"][country] = ud["ctry"].get(country, 0) + 1
+                if du > 0:
+                    ud["durs"] += du
+                    ud["durn"] += 1
+
         if uri and du > 0:
             sl = S["slow"].get(uri)
             if sl is None and len(S["slow"]) < ACC_CAP:
@@ -944,22 +967,35 @@ def overview_view(w):
 
 # ---- detail.json + detail.html -----------------------------------------------------------------
 def build_detail_json():
+    # Statistics come from the broad per uri accumulator, so every uri seen often enough gets a
+    # record, assets and API endpoints included. Navigation comes from the pageview walk and is
+    # merged in only where it exists: computing it over all requests would bury each page's real
+    # next hop under its own CSS, JS and images.
     out = {}
-    if not DETAIL:
+    udet = CUR["weekly"]["udet"]
+    if not udet:
         return out
-    ranked = sorted([kv for kv in DETAIL.items() if kv[1]], key=lambda kv: kv[1]["pv"], reverse=True)
-    for uri, d in ranked[:DETAIL_TOP]:
-        avg = int(d["durs"] / d["durn"] / 1000.0) if d["durn"] else 0
-        out[uri] = {
-            "pv": d["pv"], "uv": len(d["vis"]), "entries": d["entries"], "exits": d["exits"],
+    ranked = sorted(udet.items(), key=lambda kv: kv[1]["hits"], reverse=True)
+    for uri, u in ranked[:DETAIL_MAX]:
+        if u["hits"] < DETAIL_MIN_HITS:
+            break                       # sorted by hits, so everything after this is below it too
+        d = DETAIL.get(uri) if DETAIL else None
+        avg = int(u["durs"] / u["durn"] / 1000.0) if u["durn"] else 0
+        rec = {
+            "pv": u["hits"], "uv": len(u["vis"]),
+            "entries": d["entries"] if d else 0,
+            "exits": d["exits"] if d else 0,
             "avgms": avg,
-            "prev": [[str(k), v] for k, v in top(d["prev"], 8)],
-            "next": [[str(k), v] for k, v in top(d["next"], 8)],
-            "ext": [[str(k), v] for k, v in top(d["ext"], 8)],
-            "st": [["%s %s" % (k, reason(k)), v] for k, v in top(d["st"], 8)],
-            "meth": [[str(k), v] for k, v in top(d["meth"], 8)],
-            "ctry": [[str(k), v] for k, v in top(d["ctry"], 8)],
+            "prev": [[str(k), v] for k, v in top(d["prev"], 8)] if d else [],
+            "next": [[str(k), v] for k, v in top(d["next"], 8)] if d else [],
+            "ext": [[str(k), v] for k, v in top(d["ext"], 8)] if d else [],
+            "st": [["%s %s" % (k, reason(k)), v] for k, v in top(u["st"], 8)],
+            "meth": [[str(k), v] for k, v in top(u["meth"], 8)],
+            "ctry": [[str(k), v] for k, v in top(u["ctry"], 8)],
         }
+        # lets the page hide the navigation section rather than drawing empty cards
+        rec["nav"] = 1 if (rec["prev"] or rec["next"] or rec["ext"]) else 0
+        out[uri] = rec
     return out
 
 
@@ -969,7 +1005,7 @@ __FAVICON__
 __STYLE__
 <div class=wrap>
 <h1>Page detail</h1>
-<p class=foot>Before and after navigation is approximated from client IP and time, over the last 7 days.</p>
+<p class=foot id=foot style="display:none">Before and after navigation is approximated from client IP and time, over the last 7 days.</p>
 <div id=body><div class=card><div class=empty>Loading.</div></div></div>
 </div>
 <script>
@@ -981,19 +1017,22 @@ return r+'</tbody></table></div></div>';}
 var PAGES=null;
 function render(){
 var el=document.getElementById('body');
+var ft=document.getElementById('foot');
 var uri=decodeURIComponent(location.hash.slice(1));
 if(!uri){document.querySelector('h1').textContent='Page detail';el.innerHTML='<div class=card><div class=empty>Open this page by clicking a URL on any panel.</div></div>';return;}
 document.querySelector('h1').textContent=uri;
 var d=PAGES?PAGES[uri]:null;
-if(!d){el.innerHTML='<div class=card><div class=empty>No detail recorded for this URL. Only the top pages by pageviews get a detail record, over the last 7 days.</div></div>';return;}
+if(!d){ft.style.display='none';el.innerHTML='<div class=card><div class=empty>No detail recorded for this URL. A URL needs at least two hits in the last 7 days to get a record.</div></div>';return;}
+ft.style.display=d.nav?'':'none';
 var tiles='<div class=tiles>'
-+'<div class=tile><div class=k>Pageviews</div><div class=val>'+d.pv+'</div></div>'
-+'<div class=tile><div class=k>Unique</div><div class=val>'+d.uv+'</div></div>'
-+'<div class=tile><div class=k>Entrances</div><div class=val>'+d.entries+'</div></div>'
-+'<div class=tile><div class=k>Exits</div><div class=val>'+d.exits+'</div></div>'
-+'<div class=tile><div class=k>Avg Response</div><div class=val>'+d.avgms+' ms</div></div></div>';
-var grid='<div class=grid2>'+list('Came from (internal)',d.prev)+list('Went to (internal)',d.next)
-+list('External referrers',d.ext)+list('Status mix',d.st)+list('Methods',d.meth)+list('Countries',d.ctry)+'</div>';
++'<div class=tile><div class=k>Hits</div><div class=val>'+d.pv+'</div></div>'
++'<div class=tile><div class=k>Unique</div><div class=val>'+d.uv+'</div></div>';
+if(d.nav){tiles+='<div class=tile><div class=k>Entrances</div><div class=val>'+d.entries+'</div></div>'
++'<div class=tile><div class=k>Exits</div><div class=val>'+d.exits+'</div></div>';}
+tiles+='<div class=tile><div class=k>Avg Response</div><div class=val>'+d.avgms+' ms</div></div></div>';
+var grid='<div class=grid2>';
+if(d.nav){grid+=list('Came from (internal)',d.prev)+list('Went to (internal)',d.next)+list('External referrers',d.ext);}
+grid+=list('Status mix',d.st)+list('Methods',d.meth)+list('Countries',d.ctry)+'</div>';
 el.innerHTML=tiles+grid;}
 fetch('detail.json').then(function(r){return r.json();}).then(function(res){PAGES=res.pages||{};render();})
 .catch(function(e){document.getElementById('body').innerHTML='<div class=card><div class=empty>Could not load detail data.</div></div>';});
