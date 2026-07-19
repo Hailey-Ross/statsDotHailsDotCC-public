@@ -194,9 +194,9 @@ curl -o /dev/null -w '%{http_code}\n' https://your.site/
 
 ### Showing a requests served counter on a public page
 
-Set `HAILS_SERVED_ROOT` to a directory your web server already serves and `hails-served.timer` will
-write `served.js` there every 6 hours, starting at 00:00 UTC. The file is a one line script with the
-total
+Set `HAILS_SERVED_ROOT` to a directory your web server already serves and every regen will write
+`served.js` there, so it refreshes every 5 minutes along with the dashboard. The file is a one line
+script with the total
 across every domain, floored to two significant figures so it reads as a headline: 110,800 becomes
 110k. It never rounds up, because the sentence says "Over N".
 

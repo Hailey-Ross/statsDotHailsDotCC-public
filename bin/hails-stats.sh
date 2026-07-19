@@ -8,6 +8,7 @@ PRE=/usr/local/bin/hails-stats-pre.py
 TIMEGEN=/usr/local/bin/hails-time.py
 PANELGEN=/usr/local/bin/hails-panels.py
 ROLLUP=/usr/local/bin/hails-rollup.py
+SERVEDGEN=/usr/local/bin/hails-served.py
 BWGEN=/usr/local/bin/hails-bandwidth.py
 PERFGEN=/usr/local/bin/hails-perf.py
 LOGS=$(ls -tr /var/log/caddy/access.log* 2>/dev/null); [ -z "$LOGS" ] && exit 0
@@ -103,6 +104,21 @@ cp -f /etc/goaccess/settings.html "$STATS/settings.html" 2>/dev/null && chmod 64
 # scope generators would race on the file. It is the only state surviving the rm -rf above.
 install -d /var/lib/hails-stats
 python3 "$ROLLUP" < "$TMP"
+
+# Public requests served counter, read straight off the rollup just merged. Does nothing unless
+# HAILS_SERVED_ROOT is set. It rewrites its file only when the rounded figure changes, so running it
+# every regen costs a read and a compare on the runs where nothing moved. Fully guarded: the counter
+# must never be able to fail the dashboard rebuild.
+#
+# systemd passes HAILS_SERVED_ROOT in from /etc/hails-stats/config.env via EnvironmentFile, but a
+# manual run of this script gets no such thing. Pull just that one key out rather than sourcing the
+# file: config.env holds unquoted values containing pipes and parentheses that a shell must never
+# evaluate.
+if [ -z "${HAILS_SERVED_ROOT:-}" ] && [ -r /etc/hails-stats/config.env ]; then
+  HAILS_SERVED_ROOT=$(sed -n 's/^[[:space:]]*HAILS_SERVED_ROOT=//p' /etc/hails-stats/config.env | tail -1)
+  export HAILS_SERVED_ROOT
+fi
+python3 "$SERVEDGEN" >/dev/null 2>&1 || true
 
 gen_scope "$STATS/all" "All domains (aggregate)" "$AGGLOG" "all"
 for h in $hosts; do safe=${safeof["$h"]}; grep -F "\"host\": \"$h\"" "$TMP" > "$SCOPELOG"; gen_scope "$STATS/d/$safe" "$h" "$SCOPELOG" "$h"; done
