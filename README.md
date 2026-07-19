@@ -24,6 +24,9 @@ A landing page listing every domain Caddy serves, and for each one:
   per core CPU, uptime, and per service uptime, with a card per disk and per volume
 * **Network map**, a diagram of your hosts and what each one proxies to
 
+Optionally it also writes `served.js`, a one line script your public pages can load to show how many
+requests every domain has served in total. It is off unless you configure it.
+
 Every page has a Domain and a Panel dropdown at the top, so you can jump straight from
 "404s on one site" to "404s on another".
 
@@ -179,6 +182,7 @@ about:
 | `HAILS_PERF_TARGETS` | Sites to probe for uptime, as `name\|url\|healthy codes` separated by semicolons |
 | `HAILS_MAP_ORG` | Name shown on the network map |
 | `HAILS_MAP_PUBLIC_HOST` | Set this to also publish a sanitized public copy of the map. Leave it unset and only the private one is built |
+| `HAILS_SERVED_ROOT` | Directory to write `served.js` into for the public requests served counter. Leave it unset and nothing is written |
 
 The uptime targets need one bit of care. Set the status codes each site really returns, not just
 200. Plenty of healthy sites answer a redirect or an auth challenge on their root, and if you only
@@ -187,6 +191,31 @@ accept 200 they will show as down forever. Check first:
 ```bash
 curl -o /dev/null -w '%{http_code}\n' https://your.site/
 ```
+
+### Showing a requests served counter on a public page
+
+Set `HAILS_SERVED_ROOT` to a directory your web server already serves and `hails-served.timer` will
+write `served.js` there once a day at 00:00 UTC. The file is a one line script holding the total
+across every domain, floored to two significant figures so it reads as a headline: 110,800 becomes
+110k. It never rounds up, because the sentence says "Over N".
+
+Give the page an empty element with the id `served` and load the script. The script fills in the
+text and adds the class `on`, which is yours to style, so the counter can fade in rather than appear
+mid layout.
+
+```html
+<div id="served"></div>
+<script src="https://assets.example.com/served.js" defer></script>
+```
+
+```css
+#served { opacity: 0; transition: opacity .8s ease }
+#served.on { opacity: 1 }
+```
+
+If several sites should show the same figure, point `HAILS_SERVED_ROOT` at one shared asset host and
+have every page load that one file. The script is rewritten only when the rounded number actually
+changes, so caches stay valid on the days it does not move.
 
 ## Adding your own panel
 

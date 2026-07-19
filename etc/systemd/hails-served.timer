@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily refresh of the requests served counter
+
+[Timer]
+# Midnight UTC, stated explicitly so the schedule does not drift if the box timezone changes.
+OnCalendar=*-*-* 00:00:00 UTC
+# Catch up on the next boot if the machine was down at midnight, otherwise the counter could sit
+# stale for a whole day.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

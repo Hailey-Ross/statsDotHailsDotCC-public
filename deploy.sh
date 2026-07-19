@@ -28,8 +28,8 @@ SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new $VPS"
 say(){ printf '\n==> %s\n' "$1"; }
 
 say "Deploying scripts to /usr/local/bin"
-scp -i "$SSH_KEY" "$HERE/bin/hails-stats.sh" "$HERE/bin/hails-stats-pre.py" "$HERE/bin/hails-geoip-refresh.sh" "$HERE/bin/hails-admin.py" "$HERE/bin/hails-time.py" "$HERE/bin/hails-panels.py" "$HERE/bin/hails-map.py" "$HERE/bin/hails-rollup.py" "$HERE/bin/hails-bandwidth.py" "$HERE/bin/hails-perf-collect.py" "$HERE/bin/hails-perf.py" "$VPS:/usr/local/bin/"
-$SSH "chmod +x /usr/local/bin/hails-stats.sh /usr/local/bin/hails-stats-pre.py /usr/local/bin/hails-geoip-refresh.sh /usr/local/bin/hails-admin.py /usr/local/bin/hails-time.py /usr/local/bin/hails-panels.py /usr/local/bin/hails-map.py /usr/local/bin/hails-rollup.py /usr/local/bin/hails-bandwidth.py /usr/local/bin/hails-perf-collect.py /usr/local/bin/hails-perf.py"
+scp -i "$SSH_KEY" "$HERE/bin/hails-stats.sh" "$HERE/bin/hails-stats-pre.py" "$HERE/bin/hails-geoip-refresh.sh" "$HERE/bin/hails-admin.py" "$HERE/bin/hails-time.py" "$HERE/bin/hails-panels.py" "$HERE/bin/hails-map.py" "$HERE/bin/hails-rollup.py" "$HERE/bin/hails-bandwidth.py" "$HERE/bin/hails-perf-collect.py" "$HERE/bin/hails-perf.py" "$HERE/bin/hails-served.py" "$VPS:/usr/local/bin/"
+$SSH "chmod +x /usr/local/bin/hails-stats.sh /usr/local/bin/hails-stats-pre.py /usr/local/bin/hails-geoip-refresh.sh /usr/local/bin/hails-admin.py /usr/local/bin/hails-time.py /usr/local/bin/hails-panels.py /usr/local/bin/hails-map.py /usr/local/bin/hails-rollup.py /usr/local/bin/hails-bandwidth.py /usr/local/bin/hails-perf-collect.py /usr/local/bin/hails-perf.py /usr/local/bin/hails-served.py"
 
 say "Ensuring /etc/hails-stats/config.env (seeded once from the example, never overwritten)"
 # Everything machine specific lives here: which disk and NIC to chart, which units and sites to
@@ -44,11 +44,11 @@ say "Deploying GoAccess config + glass skin to /etc/goaccess"
 $SSH "install -d /etc/goaccess"
 scp -i "$SSH_KEY" "$HERE/etc/goaccess/goaccess.conf" "$HERE/etc/goaccess/custom.css" "$HERE/etc/goaccess/settings.html" "$VPS:/etc/goaccess/"
 
-say "Deploying systemd units + timers (stats + geoip + admin + map + perf)"
-scp -i "$SSH_KEY" "$HERE/etc/systemd/hails-stats.service" "$HERE/etc/systemd/hails-stats.timer" "$HERE/etc/systemd/hails-geoip.service" "$HERE/etc/systemd/hails-geoip.timer" "$HERE/etc/systemd/hails-admin.service" "$HERE/etc/systemd/hails-map.service" "$HERE/etc/systemd/hails-map.timer" "$HERE/etc/systemd/hails-perf.service" "$VPS:/etc/systemd/system/"
+say "Deploying systemd units + timers (stats + geoip + admin + map + perf + served)"
+scp -i "$SSH_KEY" "$HERE/etc/systemd/hails-stats.service" "$HERE/etc/systemd/hails-stats.timer" "$HERE/etc/systemd/hails-geoip.service" "$HERE/etc/systemd/hails-geoip.timer" "$HERE/etc/systemd/hails-admin.service" "$HERE/etc/systemd/hails-map.service" "$HERE/etc/systemd/hails-map.timer" "$HERE/etc/systemd/hails-perf.service" "$HERE/etc/systemd/hails-served.service" "$HERE/etc/systemd/hails-served.timer" "$VPS:/etc/systemd/system/"
 # hails-perf is resident, not timer driven, and it is restarted rather than reloaded so a changed
 # collector actually takes effect.
-$SSH "systemctl daemon-reload && systemctl enable --now hails-stats.timer hails-geoip.timer hails-map.timer >/dev/null 2>&1; systemctl enable --now hails-admin.service >/dev/null 2>&1; systemctl enable hails-perf.service >/dev/null 2>&1; systemctl restart hails-perf.service >/dev/null 2>&1; echo stats-timer: \$(systemctl is-active hails-stats.timer) geoip-timer: \$(systemctl is-active hails-geoip.timer) map-timer: \$(systemctl is-active hails-map.timer) admin: \$(systemctl is-active hails-admin.service) perf: \$(systemctl is-active hails-perf.service)"
+$SSH "systemctl daemon-reload && systemctl enable --now hails-stats.timer hails-geoip.timer hails-map.timer hails-served.timer >/dev/null 2>&1; systemctl enable --now hails-admin.service >/dev/null 2>&1; systemctl enable hails-perf.service >/dev/null 2>&1; systemctl restart hails-perf.service >/dev/null 2>&1; echo stats-timer: \$(systemctl is-active hails-stats.timer) geoip-timer: \$(systemctl is-active hails-geoip.timer) map-timer: \$(systemctl is-active hails-map.timer) served-timer: \$(systemctl is-active hails-served.timer) admin: \$(systemctl is-active hails-admin.service) perf: \$(systemctl is-active hails-perf.service)"
 
 say "Ensuring the isolated stats auth import + admins file (seeded once, never overwritten)"
 # The login lives in its own file rather than inline in the Caddyfile, so the Settings page can add
