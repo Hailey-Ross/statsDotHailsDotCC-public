@@ -37,8 +37,13 @@ User-Agent strings into the Operating Systems and Browsers panels. Debian ships 
 
 ## Fonts
 
-**[Roboto](https://fonts.google.com/specimen/Roboto)** by Christian Robertson, Apache 2.0. Loaded
-from Google Fonts by default. See the README if you would rather not make that request.
+**[Roboto](https://fonts.google.com/specimen/Roboto)** by Christian Robertson and the Roboto Project
+Authors, licensed under the [SIL Open Font License 1.1](https://openfontlicense.org/). It is bundled
+in `assets/fonts/` and served from your own box, so no page makes a request to Google.
+
+The licence text ships beside it as `assets/fonts/OFL.txt` and must stay with the files if you
+redistribute them. Two variable `woff2` files, the latin and latin-ext subsets, cover every weight
+from 100 to 900.
 
 ## Mentioned elsewhere
 

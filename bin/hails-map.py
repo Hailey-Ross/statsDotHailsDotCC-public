@@ -15,6 +15,14 @@
 #   hails-map.py --caddyfile <p> override the Caddyfile path (default /etc/caddy/Caddyfile)
 import sys, os, re, html, time, glob, json
 
+# Roboto is bundled rather than fetched from Google, so no page makes a third party call.
+# One variable file per subset covers every weight from 100 to 900.
+FONT_BASE = os.environ.get("HAILS_FONT_BASE", "/fonts").rstrip("/")
+FONT_CSS = (
+    "@font-face{font-family:'Roboto';font-style:normal;font-weight:100 900;font-display:swap;src:url(%s/roboto-latin-ext.woff2) format('woff2');unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}"
+    "@font-face{font-family:'Roboto';font-style:normal;font-weight:100 900;font-display:swap;src:url(%s/roboto-latin.woff2) format('woff2');unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}"
+) % (FONT_BASE, FONT_BASE)
+
 CADDYFILE = "/etc/caddy/Caddyfile"
 STATS_DIR = "/srv/stats"
 DRY = False
@@ -384,7 +392,7 @@ FAVICON = ('<link rel="icon" type="image/x-icon" href="data:image/x-icon;base64,
            'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA">')
 
 STYLE = """<style>
-@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700;800;900&display=swap');
+""" + FONT_CSS + """
 *{box-sizing:border-box}
 body{font-family:'Roboto',system-ui,sans-serif;min-height:100vh;margin:0;padding:4.4rem 1.2rem 3rem;color:#e8e8f0;background:radial-gradient(1100px 600px at 50% -10%,rgba(111,76,255,.16),transparent 60%),radial-gradient(900px 500px at 88% 6%,rgba(1,110,218,.12),transparent 55%),radial-gradient(800px 480px at 10% 16%,rgba(217,0,192,.08),transparent 55%),#04050c}
 .wrap{max-width:1120px;margin:0 auto}

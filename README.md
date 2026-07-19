@@ -199,6 +199,7 @@ Everything machine specific is in `/etc/hails-stats/config.env`:
 | `HAILS_MAP_PUBLIC_HOST` | Also publish a sanitized public copy of the map. Unset means only the private one |
 | `HAILS_SERVED_ROOT` | Where to write `served.js` for the requests served counter. Unset means nothing is written |
 | `HAILS_AGG_EXCLUDE` | Hosts to keep out of the All domains view, prefix matched. Each keeps its own per domain pages |
+| `HAILS_FONT_BASE` | Where the stylesheets look for the bundled Roboto. Unset means `/fonts`, same origin, which needs no CORS |
 
 Set the uptime status codes each site actually returns, not just 200. Plenty of healthy sites answer a
 redirect or an auth challenge on their root and will otherwise look dead forever:
@@ -292,9 +293,15 @@ default:
   filesystem paths and anything behind auth
 * the **requests served counter**, with `HAILS_SERVED_ROOT`. One rounded number and nothing else
 
-Pages load Roboto from Google Fonts, so each viewer makes one request to Google. That is you and
-whoever you hand logins to, never your visitors. To stop it, delete the `@import` at the top of
-`etc/goaccess/custom.css` and the matching one in each generator in `bin/`.
+Roboto is bundled in `assets/fonts/` and served from your own box, so no page calls Google either.
+`deploy.sh` puts it in `/srv/stats/fonts` and the stylesheets point at `/fonts`, same origin, nothing
+to configure.
+
+If you would rather serve it from a shared asset host, set `FONT_DIR` in `.env` and
+`HAILS_FONT_BASE` in `config.env` to match. That host then has to send
+`Access-Control-Allow-Origin`, because a font on another origin is a cross origin request. Miss that
+header and the browser blocks the font and silently falls back to your system font, which looks close
+enough that it is easy not to notice.
 
 ## Credits
 

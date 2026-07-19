@@ -24,6 +24,9 @@ fi
 # The dashboard hostname and the login name seeded on a fresh install. Both can live in .env.
 STATS_HOST="${STATS_HOST:-stats.example.com}"
 AUTH_USER="${AUTH_USER:-admin}"
+# Where the bundled fonts land. Defaults to the dashboard's own web root, which needs no CORS.
+# Set it in .env to serve them from a shared asset host instead.
+FONT_DIR="${FONT_DIR:-/srv/stats/fonts}"
 SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new $VPS"
 say(){ printf '\n==> %s\n' "$1"; }
 
@@ -43,6 +46,14 @@ else echo "  $C already present, left as is"; fi'
 say "Deploying GoAccess config + glass skin to /etc/goaccess"
 $SSH "install -d /etc/goaccess"
 scp -i "$SSH_KEY" "$HERE/etc/goaccess/goaccess.conf" "$HERE/etc/goaccess/custom.css" "$HERE/etc/goaccess/settings.html" "$VPS:/etc/goaccess/"
+
+say "Deploying the bundled Roboto to $FONT_DIR"
+# Shipped with the project so no page calls Google. One variable woff2 per subset covers every
+# weight. If FONT_DIR is on a different host to the dashboard, that host must send
+# Access-Control-Allow-Origin or the browser silently falls back to the system font.
+$SSH "install -d -m 755 '$FONT_DIR'"
+scp -i "$SSH_KEY" "$HERE/assets/fonts/"* "$VPS:$FONT_DIR/"
+$SSH "chmod 644 '$FONT_DIR'/*; ls '$FONT_DIR' | tr '\n' ' '; echo"
 
 say "Deploying systemd units + timers (stats + geoip + admin + map + perf + served)"
 scp -i "$SSH_KEY" "$HERE/etc/systemd/hails-stats.service" "$HERE/etc/systemd/hails-stats.timer" "$HERE/etc/systemd/hails-geoip.service" "$HERE/etc/systemd/hails-geoip.timer" "$HERE/etc/systemd/hails-admin.service" "$HERE/etc/systemd/hails-map.service" "$HERE/etc/systemd/hails-map.timer" "$HERE/etc/systemd/hails-perf.service" "$HERE/etc/systemd/hails-served.service" "$VPS:/etc/systemd/system/"

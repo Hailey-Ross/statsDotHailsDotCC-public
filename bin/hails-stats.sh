@@ -23,6 +23,16 @@ AGGLOG=$(mktemp); cat $LOGS | python3 "$PRE" --prefix-host > "$AGGLOG"
 cfg(){ sed -n "s/^[[:space:]]*$1=//p" /etc/hails-stats/config.env 2>/dev/null | tail -1; }
 : "${HAILS_AGG_EXCLUDE:=$(cfg HAILS_AGG_EXCLUDE)}"
 
+# Roboto is bundled rather than fetched from Google, so no page makes a third party call. One
+# variable file per subset covers every weight from 100 to 900. Default is same origin under
+# /srv/stats/fonts; point it at another host and that host must send Access-Control-Allow-Origin,
+# or the browser blocks the font and quietly falls back to the system stack.
+: "${HAILS_FONT_BASE:=$(cfg HAILS_FONT_BASE)}"
+: "${HAILS_FONT_BASE:=/fonts}"
+HAILS_FONT_BASE="${HAILS_FONT_BASE%/}"
+export HAILS_FONT_BASE
+FONT_CSS="@font-face{font-family:'Roboto';font-style:normal;font-weight:100 900;font-display:swap;src:url(${HAILS_FONT_BASE}/roboto-latin-ext.woff2) format('woff2');unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}@font-face{font-family:'Roboto';font-style:normal;font-weight:100 900;font-display:swap;src:url(${HAILS_FONT_BASE}/roboto-latin.woff2) format('woff2');unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}"
+
 # Hosts kept out of the AGGREGATE view only, comma separated, matched as a prefix of the hostname.
 # Each one still gets its own per domain scope, built from $TMP below, so it can be inspected
 # deliberately from the Domain dropdown. Useful for a host whose traffic is mostly noise, such as a
@@ -119,8 +129,8 @@ if(document.body)mount();document.addEventListener('DOMContentLoaded',mount);win
 JS
 chmod 644 "$NAVFILE"
 # Refresh the skin and settings page from the deployed sources so the web root serves current assets.
-cp -f /etc/goaccess/custom.css "$STATS/custom.css" 2>/dev/null && chmod 644 "$STATS/custom.css"
-cp -f /etc/goaccess/settings.html "$STATS/settings.html" 2>/dev/null && chmod 644 "$STATS/settings.html"
+sed "s|__FONT_BASE__|$HAILS_FONT_BASE|g" /etc/goaccess/custom.css > "$STATS/custom.css" 2>/dev/null && chmod 644 "$STATS/custom.css"
+sed "s|__FONT_BASE__|$HAILS_FONT_BASE|g" /etc/goaccess/settings.html > "$STATS/settings.html" 2>/dev/null && chmod 644 "$STATS/settings.html"
 
 # Merge this pass into the durable bandwidth store, once per regen and before any scope work: the
 # scope generators would race on the file. It is the only state surviving the rm -rf above.
@@ -144,7 +154,7 @@ cat > "$STATS/.index.html" <<HTML
 <!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>hails analytics</title>
 <link rel="icon" type="image/x-icon" href="data:image/x-icon;base64,AAABAAEAEBAQAAEABAAoAQAAFgAAACgAAAAQAAAAIAAAAAEABAAAAAAAgAAAAAAAAAAAAAAAEAAAAAAAAADGxsYAWFhYABwcHABfAP8A/9dfAADXrwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIiIiIiIiIiIjMlUkQgAiIiIiIiIiIiIiIzJVJEIAAAIiIiIiIiIiIiMyVSRCAAIiIiIiIiIiIiIRERERERERERERERERERERIiIiIiIiIiIgACVVUiIiIiIiIiIiIiIiIAAlVVIiIiIiIiIiIiIiIhEREREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA">
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700;900&display=swap');
+$FONT_CSS
 *{box-sizing:border-box}
 body{font-family:'Roboto',system-ui,sans-serif;min-height:100vh;margin:0;padding:3.5rem 1.2rem;color:#e8e8f0;background:radial-gradient(1100px 600px at 50% -10%,rgba(111,76,255,.16),transparent 60%),radial-gradient(900px 500px at 88% 6%,rgba(1,110,218,.12),transparent 55%),radial-gradient(800px 480px at 10% 16%,rgba(217,0,192,.08),transparent 55%),#04050c}
 .wrap{max-width:720px;margin:0 auto}
