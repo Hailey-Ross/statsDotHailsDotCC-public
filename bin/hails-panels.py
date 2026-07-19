@@ -266,6 +266,7 @@ for line in sys.stdin:
     os_s, br_s = os_browser(ua)
     day = time.strftime("%Y-%m-%d", time.localtime(ts))
     pageview = (not static) and ok and (ct.startswith("text/html") or ct == "")
+    navable = (not static) and ok   # joins the session walk so APIs get navigation, pageview or not
 
     for w in cw:
         S = CUR[w]
@@ -362,11 +363,17 @@ for line in sys.stdin:
             ring(S, "dsamp", DSAMPCAP, du)
         if pageview:
             S["page"] += 1
-            if not S["pv_over"]:      # pageview buffer feeds Entry/Exit pages and the detail drilldown
+        # The session buffer takes every successful non static request, not only pageviews, so an
+        # API endpoint gets real came from and went to chains. The trailing flag marks which events
+        # are pageviews, so Entry/Exit pages and their pageview column stay computed from those
+        # alone and do not start listing API endpoints.
+        if navable:
+            if not S["pv_over"]:
                 if len(S["pv"]) >= PVCAP:
                     S["pv_over"] = True
                 else:
-                    S["pv"].append((ip, ts, uri, extref, country, st, method, du))
+                    S["pv"].append((ip, ts, uri, extref, country, st, method, du,
+                                    1 if pageview else 0))
 
     for w in pw:
         P = PRV[w]
@@ -399,64 +406,60 @@ def walk_sessions(events, want_detail):
     cur = []
     prev_ip, prev_ts = None, None
 
+    # Only navigation lives here. The per uri statistics come from the broad accumulator in the main
+    # loop, so keeping duplicates here would cost a second set of visitor IPs per uri for nothing.
     def rec_uri_agg(uri, e):
         if detail is None:
             return
         d = detail.get(uri)
         if d is None:
-            d = detail[uri] = {"pv": 0, "vis": set(), "prev": {}, "next": {}, "ext": {}, "exits": 0,
-                               "entries": 0, "st": {}, "meth": {}, "ctry": {}, "durs": 0, "durn": 0}
-        d["pv"] += 1
-        if e[0]:
-            d["vis"].add(e[0])
+            d = detail[uri] = {"prev": {}, "next": {}, "ext": {}, "exits": 0, "entries": 0}
         if e[3]:
             d["ext"][e[3]] = d["ext"].get(e[3], 0) + 1
-        d["st"][e[5]] = d["st"].get(e[5], 0) + 1
-        if e[6]:
-            d["meth"][e[6]] = d["meth"].get(e[6], 0) + 1
-        if e[4]:
-            d["ctry"][e[4]] = d["ctry"].get(e[4], 0) + 1
-        if e[7] > 0:
-            d["durs"] += e[7]
-            d["durn"] += 1
 
     def flush(sess):
         nonlocal visits
         if not sess:
             return
-        visits += 1
-        eu, xu = sess[0][2], sess[-1][2]
-        src = sess[0][3] or "(direct)"
-        en = entry.get(eu)
-        if en is None:
-            en = entry[eu] = {"n": 0, "vis": set(), "src": {}}
-        en["n"] += 1
-        if sess[0][0]:
-            en["vis"].add(sess[0][0])
-        en["src"][src] = en["src"].get(src, 0) + 1
-        ex = exit_.get(xu)
-        if ex is None:
-            ex = exit_[xu] = {"n": 0, "vis": set()}
-        ex["n"] += 1
-        if sess[-1][0]:
-            ex["vis"].add(sess[-1][0])
+        # Entry and Exit pages, and the visit count, come from the pageview events alone. A session
+        # made only of API calls produces no entry or exit page, and one that begins with an API
+        # call still reports its first real page as the entrance.
+        pages = [e for e in sess if e[8]]
+        if pages:
+            visits += 1
+            eu, xu = pages[0][2], pages[-1][2]
+            src = pages[0][3] or "(direct)"
+            en = entry.get(eu)
+            if en is None:
+                en = entry[eu] = {"n": 0, "vis": set(), "src": {}}
+            en["n"] += 1
+            if pages[0][0]:
+                en["vis"].add(pages[0][0])
+            en["src"][src] = en["src"].get(src, 0) + 1
+            ex = exit_.get(xu)
+            if ex is None:
+                ex = exit_[xu] = {"n": 0, "vis": set()}
+            ex["n"] += 1
+            if pages[-1][0]:
+                ex["vis"].add(pages[-1][0])
         if detail is not None:
-            detail.setdefault(eu, None)
+            # Adjacency spans the whole session, so an API call records the page that preceded it.
             for i, e in enumerate(sess):
                 u = e[2]
                 rec_uri_agg(u, e)
-                if i == 0:
-                    detail[u]["entries"] += 1
-                if i == len(sess) - 1:
-                    detail[u]["exits"] += 1
                 if i > 0:
                     pu = sess[i - 1][2]
                     detail[u]["prev"][pu] = detail[u]["prev"].get(pu, 0) + 1
                     detail[pu]["next"][u] = detail[pu]["next"].get(u, 0) + 1
+            # Entrances and exits stay page based, so they agree with the Entry/Exit panel.
+            if pages:
+                detail[pages[0][2]]["entries"] += 1
+                detail[pages[-1][2]]["exits"] += 1
 
     for e in events:
         ip, ts = e[0], e[1]
-        pvc[e[2]] = pvc.get(e[2], 0) + 1
+        if e[8]:
+            pvc[e[2]] = pvc.get(e[2], 0) + 1
         if ip != prev_ip or (prev_ts is not None and ts - prev_ts > GAP):
             flush(cur)
             cur = []
