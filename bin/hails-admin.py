@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-# Stats admin backend: a JSON API for managing dashboard logins and running admin actions
-# (rebuild now, refresh GeoIP), plus a read only status. Run as root by hails-admin.service,
-# since it edits the Caddy auth import and reloads Caddy.
+# JSON API for managing dashboard logins and running admin actions. Run as root by
+# hails-admin.service, since it edits the Caddy auth import and reloads Caddy.
 #
 # It binds 127.0.0.1 only and trusts Caddy to enforce basic_auth and pass the name in X-Auth-User,
-# so it must never be exposed directly. Mutating endpoints additionally require an admin actor,
-# the X-Admin-CSRF header, and the actor's own password. Commands run as argument arrays, never a shell.
+# so it must never be exposed directly.
 
 import json, os, re, subprocess, tempfile, time, threading, warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -43,7 +41,6 @@ def read_users():
 
 
 def write_users(users):
-    # Regenerate the whole basic_auth block atomically so Caddy can import it verbatim.
     body = "basic_auth {\n"
     for name in sorted(users):
         body += "\t%s %s\n" % (name, users[name])
@@ -93,8 +90,7 @@ def verify(name, password):
     h = users.get(name)
     if not h or not isinstance(password, str) or not password:
         return False
-    # Prefer the bcrypt module, fall back to crypt. crypt is removed in Python 3.13, so the
-    # bcrypt module is the path that keeps working on newer Python.
+    # crypt is removed in Python 3.13, so the bcrypt module is the path that keeps working.
     try:
         import bcrypt
         return bcrypt.checkpw(password.encode(), h.encode())
@@ -122,7 +118,7 @@ def run(cmd, timeout=120):
 
 
 def caddy_reload(prev_auth):
-    # Validate the Caddyfile, fix log ownership, then reload. Rolls the auth file back if validation fails.
+    # Rolls the auth file back if validation fails.
     v = run(["caddy", "validate", "--config", CADDYFILE, "--adapter", "caddyfile"])
     if v.returncode != 0:
         with open(AUTH_FILE, "w") as f:
@@ -186,7 +182,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
-    # Gate a mutating request: admin actor, CSRF header, and a valid actor password.
     def _guard(self, data):
         actor = self._actor()
         if not actor or actor not in read_admins():
@@ -226,7 +221,6 @@ class Handler(BaseHTTPRequestHandler):
             log("%s geoip refresh" % self._actor())
             return self._send(200, {"ok": True})
 
-        # User handling endpoints all edit the auth import then reload Caddy.
         if p in ("/admin/api/users/add", "/admin/api/users/remove",
                  "/admin/api/users/password", "/admin/api/users/role"):
             actor = self._guard(data)
@@ -295,7 +289,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "not found"})
 
     def log_message(self, *a):
-        pass  # stay quiet, actions are logged to LOG_FILE
+        pass
 
 
 if __name__ == "__main__":

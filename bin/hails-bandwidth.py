@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
-# Bandwidth page for one stats scope, the aggregate or a single domain.
-#
-#   python3 hails-bandwidth.py "<TITLE>" "<OUTDIR>" "<host|all>"
-#
-# Reads the durable rollup written by hails-rollup.py, not the raw log and nothing on stdin,
-# and writes bandwidth.html into OUTDIR.
-# The Daily / Weekly / Monthly / Yearly / Total buttons pick bucket granularity, not a lookback window.
+# Bandwidth page for one stats scope:  python3 hails-bandwidth.py "<TITLE>" "<OUTDIR>" "<host|all>"
+# Reads the durable rollup written by hails-rollup.py, never the raw log, and writes bandwidth.html
+# into OUTDIR. The window buttons pick bucket granularity, not a lookback.
 import sys, json, html, os, time
 
-# Roboto is bundled rather than fetched from Google, so no page makes a third party call.
-# One variable file per subset covers every weight from 100 to 900.
 FONT_BASE = os.environ.get("HAILS_FONT_BASE", "/fonts").rstrip("/")
 FONT_CSS = (
     "@font-face{font-family:'Roboto';font-style:normal;font-weight:100 900;font-display:swap;src:url(%s/roboto-latin-ext.woff2) format('woff2');unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}"
@@ -32,7 +26,6 @@ WNOTE = {"daily": "one row per day, most recent 30",
          "total": "every day on record, combined"}
 
 
-# ---- format helpers -----------------------------------------------------------------------------
 def esc(s):
     return html.escape(str(s)) if s not in ("", None) else "(none)"
 
@@ -55,7 +48,6 @@ def bar(pct):
 
 
 def week_label(wk):
-    # ISO week key to a label carrying the Monday of that week.
     try:
         t = time.strptime(wk + "-1", "%G-W%V-%u")
         return "%s (%s)" % (wk, time.strftime("%b %d", t))
@@ -77,7 +69,6 @@ def day_label(d):
         return d
 
 
-# ---- load the rollup ----------------------------------------------------------------------------
 DOC = {}
 try:
     with open(STORE, "r", encoding="utf-8") as fh:
@@ -91,7 +82,6 @@ HOSTS = DOC.get("hosts") if isinstance(DOC.get("hosts"), dict) else {}
 SINCE = DOC.get("since") or ""
 UPDATED = DOC.get("updated") or 0
 
-# days[day] = [bytes, hits] for this scope
 days = {}
 if SCOPE == "all":
     for h in HOSTS.values():
@@ -138,14 +128,13 @@ def series(win):
         cur = out.setdefault(k, [0, 0, 0])
         cur[0] += rec[0]
         cur[1] += rec[1]
-        cur[2] += 1                      # days contributing to this bucket
+        cur[2] += 1
     rows = sorted(out.items(), key=lambda kv: kv[0], reverse=True)
     if CAP.get(win):
         rows = rows[:CAP[win]]
     return rows
 
 
-# ---- rendering ----------------------------------------------------------------------------------
 def tile(k, val, sub=""):
     return ("<div class=tile><div class=k>%s</div><div class=val>%s</div>"
             "<div class=d>%s</div></div>" % (esc(k), val, sub))
@@ -173,7 +162,6 @@ def table(rows, win):
 
 
 def by_domain_table():
-    # Aggregate scope only: bandwidth per domain, all time.
     rows = []
     for host, hd in HOSTS.items():
         if not isinstance(hd, dict):
@@ -237,8 +225,7 @@ else:
 if UPDATED:
     foot += "<br>History last updated %s." % time.strftime("%Y-%m-%d %H:%M", time.localtime(UPDATED))
 
-# Uses its own localStorage key: the shared hailsTimeView key only accepts daily, weekly and
-# monthly, so writing yearly or total into it would reset the other pages to Daily.
+# Its own localStorage key: the shared hailsTimeView key accepts only daily, weekly and monthly.
 SWITCH = """<script>
 (function(){var btns=document.querySelectorAll('.segbtn');var V=['daily','weekly','monthly','yearly','total'];
 function show(v){V.forEach(function(x){var el=document.getElementById('view-'+x);if(el)el.hidden=(x!==v);});

@@ -1,0 +1,9 @@
+[Unit]
+Description=Incremental ingest of the Caddy access log into the hails events warehouse
+# No StartLimitBurst: systemd counts starts, not failures, so against a 5 minute timer it stops a
+# healthy unit within the hour.
+
+[Service]
+EnvironmentFile=-/etc/hails-stats/config.env
+Type=oneshot
+ExecStart=/usr/local/bin/hails-ingest.py

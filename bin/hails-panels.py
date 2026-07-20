@@ -1,34 +1,154 @@
 #!/usr/bin/env python3
-# Single pass analytics for one stats scope.
+# Single pass analytics for one stats scope, written as a set of HTML pages into OUTDIR.
 #
 #   python3 hails-panels.py "<TITLE>" "<OUTDIR>" < preprocessed.json
+#   python3 hails-panels.py --from-db --scope <hostname|all> "<TITLE>" "<OUTDIR>"
 #
-# Writes every custom page into OUTDIR: the Overview (index.html), the field panels, the cross tab
-# panels, Error Pages, Trending, Content Types, Entry/Exit pages, Slowest Endpoints, and a
-# detail.json plus detail.html per page drilldown. Every page has a Daily / Weekly / Monthly
-# window switcher. Counts all traffic including bots.
-# Sessions, visits, entries and exits are inferred from client IP plus timestamp gaps, so they
-# are approximate, not beacon accurate.
-import sys, json, html, os, time, math, random, re
+# Sessions, visits, entries and exits are inferred from client IP plus timestamp gaps, so they are
+# approximate, not beacon accurate.
+import sys, json, html, os, time, math, random, re, heapq, importlib.util
 from urllib.parse import urlsplit, quote
 
-# Roboto is bundled rather than fetched from Google, so no page makes a third party call.
-# One variable file per subset covers every weight from 100 to 900.
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_pre():
+    """hails-stats-pre.py is hyphenated, so it cannot be imported by name."""
+    for cand in (os.path.join(HERE, "hails-stats-pre.py"), "/usr/local/bin/hails-stats-pre.py"):
+        if os.path.exists(cand):
+            spec = importlib.util.spec_from_file_location("hails_stats_pre", cand)
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)
+            return m
+    raise SystemExit("hails-stats-pre.py not found next to this script or in /usr/local/bin")
+
+
+PRE = load_pre()
+
 FONT_BASE = os.environ.get("HAILS_FONT_BASE", "/fonts").rstrip("/")
 FONT_CSS = (
     "@font-face{font-family:'Roboto';font-style:normal;font-weight:100 900;font-display:swap;src:url(%s/roboto-latin-ext.woff2) format('woff2');unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}"
     "@font-face{font-family:'Roboto';font-style:normal;font-weight:100 900;font-display:swap;src:url(%s/roboto-latin.woff2) format('woff2');unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}"
 ) % (FONT_BASE, FONT_BASE)
 
-TITLE = sys.argv[1] if len(sys.argv) > 1 else "All domains (aggregate)"
-OUTDIR = sys.argv[2] if len(sys.argv) > 2 else "."
-NOW = int(time.time())
+_args = sys.argv[1:]
+FROM_DB = False
+DB_SCOPE = None
+_pos = []
+_i = 0
+while _i < len(_args):
+    _a = _args[_i]
+    if _a == "--from-db":
+        FROM_DB = True
+        _i += 1
+    elif _a == "--scope":
+        DB_SCOPE = _args[_i + 1] if _i + 1 < len(_args) else ""
+        if not DB_SCOPE.strip():
+            sys.stderr.write("hails-panels: --scope needs a value (a hostname, or \"all\")\n")
+            sys.exit(2)
+        _i += 2
+    else:
+        _pos.append(_a)
+        _i += 1
+
+TITLE = _pos[0] if _pos else "All domains (aggregate)"
+OUTDIR = _pos[1] if len(_pos) > 1 else "."
+
+_seed = os.environ.get("HAILS_SEED")
+if _seed:
+    try:
+        random.seed(int(_seed))
+    except ValueError:
+        random.seed(_seed)
+try:
+    NOW = int(os.environ.get("HAILS_NOW") or time.time())
+except ValueError:
+    NOW = int(time.time())
 DAY_S, WEEK_S, MON_S = 86400, 604800, 2592000
 WINS = ("daily", "weekly", "monthly")
 SPAN = {"daily": DAY_S, "weekly": WEEK_S, "monthly": MON_S}
-CUT = {w: NOW - SPAN[w] for w in WINS}            # current window lower bound
-PCUT = {w: NOW - 2 * SPAN[w] for w in WINS}       # previous window lower bound
+CUT = {w: NOW - SPAN[w] for w in WINS}
+PCUT = {w: NOW - 2 * SPAN[w] for w in WINS}
 WLABEL = {"daily": "last 24 hours", "weekly": "last 7 days", "monthly": "last 30 days"}
+
+OLDEST = 0   # oldest ts in the source, set during the parse loop below
+
+# How stale the warehouse may be before --from-db refuses to render and lets the log path take over.
+DB_STALE_S = int(os.environ.get("HAILS_DB_STALE_S") or 1800)
+
+# Domains that count as our own. Unset means nothing is internal and every referrer is external.
+INTERNAL_DOMAINS = tuple(d.strip().lower().lstrip(".")
+                         for d in os.environ.get("HAILS_INTERNAL_DOMAINS", "").split(",") if d.strip())
+
+
+APP_REF = {"fbapp": "Facebook app"}
+
+
+def norm_netloc(netloc):
+    """One canonical form for a referrer host, used both to group it and to classify it. urlsplit
+    keeps the port and the FQDN trailing dot, either of which splits one domain across rows."""
+    n = (netloc or "").lower().strip()
+    n = n.rsplit("@", 1)[-1]
+    i = n.rfind(":")
+    if i > 0 and n[i + 1:].isdigit():
+        n = n[:i]
+    return n.rstrip(".")
+
+
+def is_internal(netloc):
+    """True if this referrer host is one of ours. Matches the registrable domain and any subdomain."""
+    if not netloc or not INTERNAL_DOMAINS:
+        return False
+    n = norm_netloc(netloc)
+    return any(n == d or n.endswith("." + d) for d in INTERNAL_DOMAINS)
+
+
+def span_txt(secs):
+    if secs >= 172800:
+        return "%.1f days" % (secs / 86400.0)
+    if secs >= 7200:
+        return "%.1f hours" % (secs / 3600.0)
+    return "%d minutes" % max(1, int(secs // 60))
+
+
+def covered():
+    return (NOW - OLDEST) if OLDEST else 0
+
+
+def cur_short(w):
+    return bool(OLDEST) and OLDEST > CUT[w] + 60
+
+
+def prev_short(w):
+    return bool(OLDEST) and OLDEST > PCUT[w] + 60
+
+
+def detail_wlabel():
+    if cur_short("weekly"):
+        return "the %s collected so far" % span_txt(covered())
+    return "the last 7 days"
+
+
+def wlabel(w, base):
+    if cur_short(w):
+        return "%s, only %s collected" % (base, span_txt(covered()))
+    return base
+
+
+def coverage_note(w):
+    if not OLDEST:
+        return ""
+    full = WLABEL[w].replace("last ", "")
+    bits = []
+    if cur_short(w):
+        bits.append("This window covers %s so far, not the full %s, because the log only reaches back "
+                    "to %s. The numbers below are real, the span is just shorter than the label."
+                    % (span_txt(covered()), full, time.strftime("%Y-%m-%d %H:%M",
+                                                                time.localtime(OLDEST))))
+    if prev_short(w):
+        bits.append("Comparisons against the preceding %s are hidden, since there is not a full prior "
+                    "window to measure against." % full)
+    return ("<div class=note>" + " ".join(bits) + "</div>") if bits else ""
 
 FLATCAP = 500     # rows shown on a flat panel
 XPAR = 200        # parents shown on a cross tab panel
@@ -40,7 +160,7 @@ PVCAP = 200000    # per window pageview buffer ceiling (session approximation)
 SAMPCAP = 400     # per uri duration samples for percentiles
 DSAMPCAP = 3000   # per window duration samples for the p95 KPI tile
 GAP = 1800        # session gap in seconds (30 minutes)
-ACC_CAP = 60000   # max distinct keys kept per accumulation dict (memory guard vs high cardinality)
+ACC_CAP = 60000   # max distinct keys kept per accumulation dict
 XCHILD_CAP = 2000 # max distinct children kept per cross tab parent
 
 STATIC = (".css", ".js", ".mjs", ".map", ".jpg", ".jpeg", ".png", ".gif", ".ico", ".svg", ".webp",
@@ -57,7 +177,6 @@ REASON = {200: "OK", 201: "Created", 202: "Accepted", 204: "No Content", 206: "P
           502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
           505: "HTTP Version Not Supported"}
 
-# Geo and ASN come from the DB-IP databases, OS and Browser from the User-Agent.
 # Needs python3-maxminddb and python3-user-agents. If either is missing those columns render empty.
 try:
     import maxminddb
@@ -130,23 +249,61 @@ def is_static(uri):
     return uri.split("?", 1)[0].lower().endswith(STATIC)
 
 
-# Vulnerability scanner probes. These are real traffic and stay in every count and every panel: they
-# are only kept out of the NAVIGATION lists, where a scanner walking a list of paths is noise rather
-# than a visitor browsing the site.
-#
-# Anchored to path segments and deliberately free of broad words. An earlier draft matched "backup"
-# and swallowed a busy real endpoint at /api/admin/backups/log/. Match on a segment boundary, never
-# on a substring anywhere in the path.
-PROBE_RE = re.compile(
-    r"(?:^|/)(?:\.env|\.git/|\.svn/|\.aws/|\.ssh/|\.DS_Store"
-    r"|phpinfo\.php|php-info\.php|phpversion\.php|php\.php|i\.php|info\.php|test\.php"
-    r"|shell\.php|eval-stdin\.php|adminer\.php|phpmyadmin"
-    r"|xmlrpc\.php|wp-config\.php|wp-login\.php|wp-admin/|wp-includes/)"
-    r"|rest_route=/wp/", re.I)
+_tcache = {}
 
 
+def tparts(ts):
+    """(struct_time, "YYYY-MM-DD", "GGGG-Www") for a timestamp, memoised on the MINUTE rather than
+    the hour, because 30 and 45 minute UTC offsets exist."""
+    m = ts // 60
+    v = _tcache.get(m)
+    if v is None:
+        lt = time.localtime(ts)
+        v = _tcache[m] = (lt, time.strftime("%Y-%m-%d", lt), time.strftime("%G-W%V", lt))
+    return v
+
+
+_sstr = {}
+
+
+def sstr(st):
+    s = _sstr.get(st)
+    if s is None:
+        s = _sstr[st] = str(st)
+    return s
+
+
+# The three windows are NESTED (CUT monthly < weekly < daily), so there are four possible answers.
+_CW_D = ("daily", "weekly", "monthly")
+_CW_W = ("weekly", "monthly")
+_CW_M = ("monthly",)
+
+
+def windows_for(ts):
+    # The ORDER matters: accumulator insertion order decides how tied rows sort at render.
+    if ts >= CUT["daily"]:
+        return _CW_D
+    if ts >= CUT["weekly"]:
+        return _CW_W
+    if ts >= CUT["monthly"]:
+        return _CW_M
+    return ()
+
+
+_PW = {w: (w,) for w in WINS}
+
+
+def prev_windows_for(ts):
+    for w in WINS:
+        if PCUT[w] <= ts < CUT[w]:
+            return _PW[w]
+    return ()
+
+
+# ENDSWITH, NOT EQUALITY: the aggregate scope prefixes the host, so the sentinel arrives as
+# <host>/(probe). Not PRE.is_probe either, which is a different test taking a whole log object.
 def is_probe(uri):
-    return bool(PROBE_RE.search(uri))
+    return isinstance(uri, str) and uri.endswith(PRE.PROBE_SENTINEL)
 
 
 # ---- accumulators -------------------------------------------------------------------------------
@@ -173,7 +330,7 @@ def bump(d, k, ok, ip, by, du):
         return
     b = d.get(k)
     if b is None:
-        if len(d) >= ACC_CAP:   # memory guard: stop minting new keys past the ceiling
+        if len(d) >= ACC_CAP:
             return
         b = d[k] = nb()
     _bumpb(b, ok, ip, by, du)
@@ -197,17 +354,21 @@ def xbump(xt, pk, ck, ok, ip, by, du):
         _bumpb(cb, ok, ip, by, du)
 
 
+_NKEY = {"samp": "samp_n", "dsamp": "dsamp_n"}
+
+
 def ring(store, key, cap, val):
     # Algorithm R reservoir sampling: a uniform sample of all values seen, not just the most recent.
+    nk = _NKEY.get(key) or (key + "_n")
     lst = store[key]
-    n = store.get(key + "_n", 0)
+    n = store.get(nk, 0)
     if len(lst) < cap:
         lst.append(val)
     else:
         j = random.randint(0, n)
         if j < cap:
             lst[j] = val
-    store[key + "_n"] = n + 1
+    store[nk] = n + 1
 
 
 FLATKEYS = ["requests", "static", "not_found", "hosts", "mime", "tls", "vhosts", "geo", "asn",
@@ -215,7 +376,8 @@ FLATKEYS = ["requests", "static", "not_found", "hosts", "mime", "tls", "vhosts",
 
 
 def new_state():
-    return {"flat": {k: {} for k in FLATKEYS}, "xref": {}, "xsite": {}, "xstatus": {}, "xmethod": {},
+    return {"flat": {k: {} for k in FLATKEYS}, "xref": {}, "xsite": {},
+            "xref_int": {}, "xsite_int": {}, "xstatus": {}, "xmethod": {},
             "err": {}, "tnow": {}, "slow": {}, "pv": [], "pv_over": False, "udet": {}, "blink": {},
             "vis": set(), "total": 0, "err_n": 0, "bytes": 0, "page": 0,
             "durs": 0, "durn": 0, "dsamp": [], "dsamp_n": 0, "last": {}, "visits": 0}
@@ -229,22 +391,142 @@ def new_prev():
 CUR = {w: new_state() for w in WINS}
 PRV = {w: new_prev() for w in WINS}
 
+# ---- time breakdown state -----------------------------------------------------------------------
+DOW = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def newb():
+    return {"hits": 0, "valid": 0, "failed": 0, "bytes": 0, "vis": set()}
+
+
+t_hours = {h: newb() for h in range(24)}   # last 24 hours, by hour of day
+t_days = {d: newb() for d in range(7)}     # last 7 days, by day of week
+t_weeks = {}                               # last 30 days, by ISO week
+t_heat = [[0] * 24 for _ in range(7)]      # last 30 days, hits by (day of week, hour)
+
+
+# ---- record sources -----------------------------------------------------------------------------
+# Two producers, one consumer: the warehouse producer rebuilds the same object shape the
+# preprocessor writes, so the parse loop below never learns about database rows.
+
+def stdin_records():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            yield json.loads(line)
+        except Exception:
+            continue
+
+
+def db_records():
+    """Yield preprocessor shaped objects straight out of events.db.
+
+    Country, ASN, OS and browser are already resolved in the warehouse, so they are filled into the
+    lookup caches as rows stream. A NULL stays uncached deliberately, so the live lookup still runs.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import hails_query as hq
+
+    if DB_SCOPE is None:
+        sys.stderr.write("hails-panels: --from-db requires --scope (a hostname, or \"all\")\n")
+        sys.exit(2)
+
+    con = hq.connect()
+
+    # Global rather than per scope: a quiet host can legitimately see nothing for hours.
+    newest = con.execute("SELECT MAX(ts) FROM event").fetchone()[0]
+    if newest is None or (NOW - newest) > DB_STALE_S:
+        con.close()
+        sys.stderr.write(
+            "hails-panels: warehouse is stale, newest event is %s (%s), refusing to render\n"
+            % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(newest)) if newest else "none",
+               ("%.1f hours old" % ((NOW - newest) / 3600.0)) if newest else "table empty"))
+        sys.exit(4)
+
+    scope = DB_SCOPE
+    ids = hq.scope_ids(con, scope)
+
+    if not ids:
+        con.close()
+        sys.stderr.write("hails-panels: scope %r matches no host in the warehouse "
+                         "(unknown name, or dropped by HAILS_DROP_HOSTS)\n" % scope)
+        sys.exit(3)
+    # The warehouse stores the bare uri, so the aggregate scope's host prefix is reapplied here.
+    prefix = (scope == "all")
+    lo = PCUT["monthly"]
+    idlist = "(" + ",".join(str(int(i)) for i in ids) + ")"
+
+    # Per scope, and from its own query rather than from the row stream, which is floored at the
+    # window bound below and would pin OLDEST to 60 days forever.
+    mn = con.execute("SELECT MIN(ts) FROM event WHERE host_id IN %s" % idlist).fetchone()[0]
+    if mn:
+        global OLDEST
+        OLDEST = mn if not OLDEST else min(OLDEST, mn)
+
+    q = (
+        "SELECT e.ts, e.status, e.size, e.duration, h.host, u.uri, ip.ip, ua.ua, r.ref, "
+        "       m.val, ct.val, tl.val, lo.val, cs.val, ns.val, osv.val, brv.val "
+        "FROM event e "
+        "JOIN dim_host h ON h.id=e.host_id "
+        "JOIN dim_uri  u ON u.id=e.uri_id "
+        "JOIN dim_ip  ip ON ip.id=e.ip_id "
+        "LEFT JOIN dim_ua  ua ON ua.id=e.ua_id "
+        "LEFT JOIN dim_ref r  ON r.id=e.ref_id "
+        "LEFT JOIN dim_str m  ON m.id=e.method_id "
+        "LEFT JOIN dim_str ct ON ct.id=e.ctype_id "
+        "LEFT JOIN dim_str tl ON tl.id=e.tls_id "
+        "LEFT JOIN dim_str lo ON lo.id=e.loc_id "
+        "LEFT JOIN dim_str cs ON cs.id=ip.country_id "
+        "LEFT JOIN dim_str ns ON ns.id=ip.asn_id "
+        "LEFT JOIN dim_str osv ON osv.id=ua.os_id "
+        "LEFT JOIN dim_str brv ON brv.id=ua.browser_id "
+        # (src_id, src_off) is the byte position, which IS log order. Ordering by ts is not the
+        # same thing: the line is written when the response completes, ts is when it started.
+        "WHERE e.ts>=? AND e.host_id IN %s ORDER BY e.src_id, e.src_off" % idlist)
+
+    try:
+        for (ts, st, size, dur, host, uri, ip, ua, ref, meth, ctype, tls, loc,
+             cty, asn, os_v, br_v) in con.execute(q, (lo,)):
+            if ip:
+                if cty:
+                    geo_cache[ip] = cty
+                if asn:
+                    asn_cache[ip] = asn
+            if ua and os_v and br_v:
+                ua_cache[ua] = (os_v, br_v)
+            yield {
+                "ts": ts,
+                "status": st,
+                "size": size,
+                "duration": dur,
+                "request": {
+                    "client_ip": ip or "",
+                    "host": host or "",
+                    # isinstance, not truthiness: an empty uri must still yield the bare host, as it
+                    # does in hails-stats-pre.py's aggregate writer.
+                    "uri": ((host + uri) if (prefix and isinstance(uri, str)) else (uri or "")),
+                    "method": meth or "",
+                    "headers": {"User-Agent": [ua or ""], "Referer": [ref or ""]},
+                    "tls": {"version": tls or ""},
+                },
+                "resp_headers": {"Content-Type": [ctype or ""], "Location": [loc or ""]},
+            }
+    finally:
+        con.close()
+
 
 # ---- parse --------------------------------------------------------------------------------------
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        o = json.loads(line)
-    except Exception:
-        continue
+for o in (db_records() if FROM_DB else stdin_records()):
     try:
         ts = int(o.get("ts"))
     except Exception:
         continue
-    cw = [w for w in WINS if ts >= CUT[w]]
-    pw = [w for w in WINS if PCUT[w] <= ts < CUT[w]]
+    if ts > 0 and (not OLDEST or ts < OLDEST):
+        OLDEST = ts
+    cw = windows_for(ts)
+    pw = prev_windows_for(ts)
     if not cw and not pw:
         continue
     req = o.get("request") or {}
@@ -290,34 +572,43 @@ for line in sys.stdin:
             netloc = ""
         if not netloc:
             netloc = ref.split("/", 1)[0]
-        netloc = netloc.lower().strip()
-    extref = netloc if (netloc and netloc != host) else ""
+        netloc = norm_netloc(netloc)
+        netloc = APP_REF.get(ref.split("://", 1)[0].lower(), netloc) if "://" in ref else netloc
+    internal = bool(netloc) and is_internal(netloc)
+    extref = netloc if (netloc and not internal and netloc != host) else ""
     country = country_of(ip)
     network = asn_of(ip)
     os_s, br_s = os_browser(ua)
-    day = time.strftime("%Y-%m-%d", time.localtime(ts))
+    lt, day, wk = tparts(ts)
+
+    if ts >= CUT["monthly"]:
+        wb = t_weeks.get(wk)
+        if wb is None:
+            wb = t_weeks[wk] = newb()
+        targets = [wb]
+        if ts >= CUT["daily"]:
+            targets.append(t_hours[lt.tm_hour])
+        if ts >= CUT["weekly"]:
+            targets.append(t_days[lt.tm_wday])
+        for b in targets:
+            b["hits"] += 1
+            b["valid"] += 1 if ok else 0
+            b["failed"] += 0 if ok else 1
+            b["bytes"] += by
+            if ip:
+                b["vis"].add(ip)
+        t_heat[lt.tm_wday][lt.tm_hour] += 1
+
     pageview = (not static) and ok and (ct.startswith("text/html") or ct == "")
-    navable = (not static) and ok   # joins the session walk so APIs get navigation, pageview or not
+    navable = (not static) and ok
 
     # A catch all redirect: a 3xx whose Location is a bare origin, sent for a path that is not the
-    # root. That is a site bouncing an unknown path to its homepage, which is what a URL shortener
-    # does with a slug it does not recognise, and it is not navigation.
-    #
-    # This is the structural way to spot a scanner without a list of paths to guess at. A scanner
-    # walks a list of urls, every one is unknown, every one bounces to the homepage, and because the
-    # visitor genuinely does arrive at the homepage next it manufactures real looking journeys into
-    # the front page.
-    #
-    # Two conditions keep it honest. Requiring a Location leaves 304 Not Modified alone, which is a
-    # real cached page view. Requiring the path to not be the root spares whole domain redirects,
-    # which are legitimate arrival paths worth seeing.
+    # root. That is a site bouncing an unknown path to its homepage, and it is not navigation.
     catchall = False
     if 300 <= st < 400 and loc:
         lp = urlsplit(loc)
-        # The aggregate scope carries a host prefix on the uri (example.com/), so the path has to be
-        # taken off the front rather than parsed out with urlsplit, which would treat the whole
-        # string as a path and see the root as a non root path. Aggregate uris never start with a
-        # slash, which is the discriminator.
+        # An aggregate uri is host prefixed and so does not start with a slash, which is the
+        # discriminator between the two row shapes.
         rp = uri.split("?", 1)[0]
         if not rp.startswith("/"):
             i = rp.find("/")
@@ -340,12 +631,16 @@ for line in sys.stdin:
         bump(f["os"], os_s, ok, ip, by, du)
         bump(f["browsers"], br_s, ok, ip, by, du)
         bump(f["days"], day, ok, ip, by, du)
-        xbump(S["xstatus"], str(st), uri or None, ok, ip, by, du)
+        xbump(S["xstatus"], sstr(st), uri or None, ok, ip, by, du)
         if method:
             xbump(S["xmethod"], method, uri or None, ok, ip, by, du)
         if ref:
-            xbump(S["xref"], ref, uri or None, ok, ip, by, du)
-            xbump(S["xsite"], netloc, uri or None, ok, ip, by, du)
+            if internal:
+                xbump(S["xref_int"], ref, uri or None, ok, ip, by, du)
+                xbump(S["xsite_int"], netloc, uri or None, ok, ip, by, du)
+            else:
+                xbump(S["xref"], ref, uri or None, ok, ip, by, du)
+                xbump(S["xsite"], netloc, uri or None, ok, ip, by, du)
         if not ok and uri:
             e = S["err"].get(uri)
             if e is None and len(S["err"]) < ACC_CAP:
@@ -360,15 +655,14 @@ for line in sys.stdin:
                 e["st"][st] = e["st"].get(st, 0) + 1
                 if extref:
                     e["ref"][extref] = e["ref"].get(extref, 0) + 1
-                # 404s get their own full referrer list. e["ref"] cannot serve this: it is netloc
-                # only and pools every error status, so it cannot say who links to a missing page.
                 if st == 404 and ref and len(e["nfref"]) < XCHILD_CAP:
                     e["nfref"][ref] = e["nfref"].get(ref, 0) + 1
                 e["first"] = min(e["first"], ts)
                 e["last"] = max(e["last"], ts)
                 if ip:
                     e["vis"].add(ip)
-        if uri and not static and ok and method == "GET":
+        # Probes are excluded on both sides of the comparison, here and in the previous window.
+        if uri and not static and ok and method == "GET" and not is_probe(uri):
             t = S["tnow"].get(uri)
             if t is None and len(S["tnow"]) < ACC_CAP:
                 t = S["tnow"][uri] = {"h": 0, "vis": set()}
@@ -376,10 +670,6 @@ for line in sys.stdin:
                 t["h"] += 1
                 if ip:
                     t["vis"].add(ip)
-        # Per uri statistics for the detail drilldown, over every request: any method, any status,
-        # any content type, static included. Kept separate from the pageview buffer above, which
-        # stays narrow because it also feeds Entry/Exit pages. Being a plain dict rather than a per
-        # event buffer, it also needs no session ordering and cannot hit PVCAP.
         if uri:
             ud = S["udet"].get(uri)
             if ud is None and len(S["udet"]) < ACC_CAP:
@@ -396,8 +686,6 @@ for line in sys.stdin:
                     ud["ctry"][country] = ud["ctry"].get(country, 0) + 1
                 if network:
                     ud["asn"][network] = ud["asn"].get(network, 0) + 1
-                # the full referring url, not just its host: the netloc alone cannot tell you which
-                # page linked in, which is the thing you want to go and fix
                 if ref and len(ud["refs"]) < XCHILD_CAP:
                     ud["refs"][ref] = ud["refs"].get(ref, 0) + 1
                 ud["days"][day] = ud["days"].get(day, 0) + 1
@@ -405,16 +693,10 @@ for line in sys.stdin:
                     ud["durs"] += du
                     ud["durn"] += 1
 
-        # Broken links, keyed by the page the link sits ON rather than the missing target. Built from
-        # the Referer header, not the session walk: a 404 fails the ok test so it never reaches the
-        # session buffer, and the header states outright which page carried the link.
-        # Probes excluded: a scanner requesting .env with a spoofed Referer is not a broken link on
-        # the page it claims to come from.
+        # Broken links, keyed by the page the link sits ON rather than the missing target. The key
+        # is shaped like a detail key: host prefixed in the aggregate scope, path only per domain.
         if uri and st == 404 and ref and netloc and not is_probe(uri):
             path = urlsplit(ref).path or "/"
-            # detail keys are host prefixed in the aggregate scope and path only per domain, so the
-            # referring key must be built the same way or this card never resolves. Aggregate uris
-            # never start with a slash, which is the discriminator.
             src = path if uri.startswith("/") else (netloc + path)
             bl = S["blink"].get(src)
             if bl is None and len(S["blink"]) < ACC_CAP:
@@ -433,8 +715,10 @@ for line in sys.stdin:
                 ring(sl, "samp", SAMPCAP, du)
         if ip:
             S["vis"].add(ip)
-            lw = S["last"].get(ip)          # streaming sessions over all activity: a new session on
-            if lw is None or ts - lw > GAP:  # a first sighting or a gap over GAP seconds
+            # ORDER SENSITIVE, and the log is only nearly chronological, so this undercounts by a
+            # small bounded amount.
+            lw = S["last"].get(ip)
+            if lw is None or ts - lw > GAP:
                 S["visits"] += 1
             S["last"][ip] = ts
         S["total"] += 1
@@ -447,10 +731,6 @@ for line in sys.stdin:
             ring(S, "dsamp", DSAMPCAP, du)
         if pageview:
             S["page"] += 1
-        # The session buffer takes every successful non static request, not only pageviews, so an
-        # API endpoint gets real came from and went to chains. The trailing flag marks which events
-        # are pageviews, so Entry/Exit pages and their pageview column stay computed from those
-        # alone and do not start listing API endpoints.
         if navable:
             if not S["pv_over"]:
                 if len(S["pv"]) >= PVCAP:
@@ -474,7 +754,8 @@ for line in sys.stdin:
         if du > 0:
             P["durs"] += du
             P["durn"] += 1
-        if uri and not static and ok and method == "GET":
+        # Same gate as the current window above. See the note there.
+        if uri and not static and ok and method == "GET" and not is_probe(uri):
             if uri in P["tprev"] or len(P["tprev"]) < ACC_CAP:
                 P["tprev"][uri] = P["tprev"].get(uri, 0) + 1
         if pageview:
@@ -490,8 +771,6 @@ def walk_sessions(events, want_detail):
     cur = []
     prev_ip, prev_ts = None, None
 
-    # Only navigation lives here. The per uri statistics come from the broad accumulator in the main
-    # loop, so keeping duplicates here would cost a second set of visitor IPs per uri for nothing.
     def rec_uri_agg(uri, e):
         if detail is None:
             return
@@ -505,9 +784,6 @@ def walk_sessions(events, want_detail):
         nonlocal visits
         if not sess:
             return
-        # Entry and Exit pages, and the visit count, come from the pageview events alone. A session
-        # made only of API calls produces no entry or exit page, and one that begins with an API
-        # call still reports its first real page as the entrance.
         pages = [e for e in sess if e[8]]
         if pages:
             visits += 1
@@ -527,26 +803,18 @@ def walk_sessions(events, want_detail):
             if pages[-1][0]:
                 ex["vis"].add(pages[-1][0])
         if detail is not None:
-            # Adjacency spans the whole session, so an API call records the page that preceded it.
-            # Edges touching a scanner probe are dropped: a scanner working through a path list is
-            # not navigation, and it otherwise fills every busy page's next hop list. The probe
-            # still gets its own record and still counts everywhere else, it simply links nowhere.
-            # Dropped at the edge rather than by leaving probes out of the session buffer, so that
-            # session segmentation, and therefore Entry and Exit pages, are completely unaffected.
+            # Probe edges are dropped here rather than by leaving probes out of the session buffer,
+            # so session segmentation is unaffected.
             for i, e in enumerate(sess):
                 u = e[2]
                 rec_uri_agg(u, e)
                 if i > 0:
                     pe = sess[i - 1]
                     pu = pe[2]
-                    # e[9] is the structural test and does the heavy lifting with no upkeep.
-                    # is_probe is the backstop for the case it cannot see: a redirect that PRESERVES
-                    # the path, such as www to apex, where the Location is not a bare origin.
                     if e[9] or pe[9] or is_probe(u) or is_probe(pu):
                         continue
                     detail[u]["prev"][pu] = detail[u]["prev"].get(pu, 0) + 1
                     detail[pu]["next"][u] = detail[pu]["next"].get(u, 0) + 1
-            # Entrances and exits stay page based, so they agree with the Entry/Exit panel.
             if pages:
                 detail[pages[0][2]]["entries"] += 1
                 detail[pages[-1][2]]["exits"] += 1
@@ -567,8 +835,8 @@ def walk_sessions(events, want_detail):
 SESS = {}
 DETAIL = None
 for w in WINS:
-    # walk_sessions gives Entry/Exit pages, per uri pageview counts and the weekly detail adjacency.
-    # The Visits KPI keeps the streaming all activity count, not the pageview only count returned here.
+    # The Visits KPI uses the streaming all activity count, not the pageview only count walk_sessions
+    # returns.
     entry, exit_, pvc, _pv_visits, detail = walk_sessions(CUR[w]["pv"], want_detail=(w == "weekly"))
     SESS[w] = {"entry": entry, "exit": exit_, "pvc": pvc, "visits": CUR[w]["visits"]}
     if w == "weekly":
@@ -587,6 +855,16 @@ def hb(n):
             return ("%d %s" % (int(n), unit)) if unit == "B" else ("%.1f %s" % (n, unit))
         n /= 1024
     return "0 B"
+
+
+# hb renders "1.2 MB", which sorts above "9.0 KB" as text, so a byte cell carries the raw count for
+# table.js to sort on.
+def bcell(n, cls=""):
+    return '<td%s data-s="%d">%s</td>' % ((" class=" + cls) if cls else "", int(n), hb(n))
+
+
+def bspan(n):
+    return '<span class=n data-s="%d">%s</span>' % (int(n), hb(n))
 
 
 def avgms(b):
@@ -619,7 +897,6 @@ def reason(code):
 
 
 def dlink(uri):
-    # a uri value rendered as a link to the per page detail drilldown
     return "<a class=v href='detail.html#%s'>%s</a>" % (quote(str(uri), safe=""), esc(uri))
 
 
@@ -627,7 +904,9 @@ def bar(pct):
     return "<span class=bar style='width:%d%%'></span>" % pct
 
 
-def fmt_delta(cur, prev, invert=False):
+def fmt_delta(cur, prev, invert=False, w=None):
+    if w is not None and prev_short(w):
+        return ""
     if prev == 0:
         return "<span class=dn0>new</span>" if cur else ""
     p = (cur - prev) / float(prev) * 100.0
@@ -683,6 +962,7 @@ a.v:hover{text-decoration:underline}
 tr.tot td{font-weight:700;color:#cfe0ff;border-top:1px solid rgba(255,255,255,.14)}
 tr:hover td{background:rgba(111,76,255,.06)}
 .empty{color:rgba(255,255,255,.4);padding:.6rem}
+.note{background:rgba(255,196,84,.08);border:1px solid rgba(255,196,84,.32);border-left-width:3px;border-radius:8px;color:rgba(255,214,140,.92);padding:.7rem .9rem;margin:0 0 1rem;font-size:.85rem;line-height:1.55}
 .foot{color:rgba(255,255,255,.42);font-size:.78rem;margin-top:1.2rem;line-height:1.6}
 .up{color:#8fffca}.down{color:#ff9db2}.dn0{color:rgba(255,255,255,.45)}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.7rem;margin:0 0 1.2rem}
@@ -691,12 +971,12 @@ tr:hover td{background:rgba(111,76,255,.06)}
 .tile .val{font:900 1.5rem/1.2 Roboto,system-ui,sans-serif;color:#fff;margin:.15rem 0}
 .tile .d{font-size:.8rem}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1rem}
-/* Cards here are narrow and the labels are urls, so the table has to take its width from the card
-   and not from its content, or a long url sets the minimum width and pushes the count column outside
-   the card. table-layout:fixed does that, and it is also what lets the ellipsis already on td.lbl
-   apply, since max-width on a cell is ignored under the default auto layout.
-   Widths are proportional rather than pinned so long headings never clip, and .v only has its cap
-   relaxed, keeping the inline-block and baseline the other cards are aligned to. */
+/* Cards in a grid are narrow and the labels are urls, so the table has to take its width from the
+   card and not from its content, or a long url sets the minimum width and pushes the count column
+   outside the card. table-layout:fixed does that, and it is also what lets the ellipsis already on
+   td.lbl apply, since max-width on a cell is ignored under the default auto layout.
+   Widths are proportional rather than pinned so headings like Entrances never clip, and .v only has
+   its cap relaxed, keeping the inline-block and baseline the other cards are aligned to. */
 .grid2 table{table-layout:fixed}
 .grid2 th:first-child,.grid2 td.lbl{width:72%}
 .grid2 td.lbl{max-width:none}
@@ -724,7 +1004,8 @@ btns.forEach(function(b){b.onclick=function(){show(b.getAttribute('data-view'));
 var saved='daily';try{saved=localStorage.getItem('hailsTimeView')||'daily';}catch(e){}
 if(V.indexOf(saved)<0)saved='daily';show(saved);})();
 </script>
-<script src="/nav.js"></script>"""
+<script src="/nav.js"></script>
+<script src="/table.js"></script>"""
 
 
 def page(sub, views, foot):
@@ -737,16 +1018,22 @@ def page(sub, views, foot):
             "<div class=view id=view-weekly hidden>%s</div>\n"
             "<div class=view id=view-monthly hidden>%s</div>\n"
             "<p class=foot>%s</p>\n</div>\n%s\n") % (
-        esc(sub), FAVICON, STYLE, esc(sub), views["daily"], views["weekly"], views["monthly"],
+        esc(sub), FAVICON, STYLE, esc(sub),
+        coverage_note("daily") + views["daily"],
+        coverage_note("weekly") + views["weekly"],
+        coverage_note("monthly") + views["monthly"],
         foot, SWITCHER_JS)
 
 
-FOOT_BASE = ("Daily is the last 24 hours, Weekly the last 7 days, Monthly the last 30 days. All traffic "
+FOOT_BASE = ("Daily is the last 24 hours, Weekly the last 7 days, Monthly the last 30 days, or as much "
+             "of each as the log holds: a window shorter than its label says so at the top. All traffic "
              "including bots, so totals run higher than the humans only chart dashboard. Valid Requests "
-             "are status under 400, Failed Requests are status 400 and above.")
+             "are status under 400, Failed Requests are status 400 and above. Click a column heading "
+             "to sort by it, click again to reverse, and shift click a second and third heading to "
+             "sort by those as tiebreaks.")
 
-# Required attribution for the DB-IP Lite databases, which are CC BY 4.0. Keep it on any page that
-# shows country or network data.
+# Licence condition of the DB-IP Lite databases: this must stay visible on any page showing country
+# or network data.
 DBIP_CREDIT = 'IP Geolocation by <a href="https://db-ip.com">DB-IP</a>.'
 
 
@@ -755,7 +1042,8 @@ def flat_table(d, by_key=False, link=False):
     if by_key:
         items = sorted(d.items(), key=lambda kv: kv[0])
     else:
-        items = sorted(d.items(), key=lambda kv: kv[1]["hits"], reverse=True)
+        # len(d) below is the real total, since items is already truncated to FLATCAP.
+        items = heapq.nlargest(FLATCAP, d.items(), key=lambda kv: kv[1]["hits"])
     if not items:
         return "<div class=card><div class=empty>No requests in this window.</div></div>"
     shown = items[:FLATCAP]
@@ -771,21 +1059,21 @@ def flat_table(d, by_key=False, link=False):
         tv |= b["vis"]
         val = dlink(k) if link else ("<span class=v>%s</span>" % esc(k))
         rows += ("<tr><td class=lbl>%s%s</td><td>%s</td><td>%s</td><td class=ok>%s</td>"
-                 "<td class=bad>%s</td><td>%s</td><td>%s</td></tr>") % (
+                 "<td class=bad>%s</td>%s<td>%s</td></tr>") % (
             val, bar(int(round(100.0 * b["hits"] / mx))), b["hits"], len(b["vis"]),
-            b["valid"], b["failed"], hb(b["bytes"]), avgms(b))
+            b["valid"], b["failed"], bcell(b["bytes"]), avgms(b))
     rows += ("<tr class=tot><td class=lbl>Total (shown)</td><td>%s</td><td>%s</td><td class=ok>%s</td>"
-             "<td class=bad>%s</td><td>%s</td><td></td></tr>") % (th, len(tv), tv2, tf, hb(tb))
+             "<td class=bad>%s</td>%s<td></td></tr>") % (th, len(tv), tv2, tf, bcell(tb))
     note = ""
-    if len(items) > FLATCAP:
-        note = "<p class=foot>Showing the top %d of %d distinct values by hits.</p>" % (FLATCAP, len(items))
-    return ("<div class=card><div class=tw><table><thead><tr><th>Value</th><th>Hits</th>"
+    if len(d) > FLATCAP:
+        note = "<p class=foot>Showing the top %d of %d distinct values by hits.</p>" % (FLATCAP, len(d))
+    return ("<div class=\"card sortable\"><div class=tw><table><thead><tr><th>Value</th><th>Hits</th>"
             "<th>Unique Visitors</th><th>Valid</th><th>Failed</th><th>Bandwidth</th><th>Avg ms</th>"
             "</tr></thead><tbody>" + rows + "</tbody></table></div></div>" + note)
 
 
 def xtab(xt, child_cols, child_row, parent_link=False, parent_reason=False):
-    items = sorted(xt.items(), key=lambda kv: kv[1]["b"]["hits"], reverse=True)
+    items = heapq.nlargest(XPAR, xt.items(), key=lambda kv: kv[1]["b"]["hits"])
     if not items:
         return "<div class=card><div class=empty>No requests in this window.</div></div>"
     head = ("<div class=xhead><span>Value</span><span>Hits</span><span>Unique</span><span>Valid</span>"
@@ -807,10 +1095,11 @@ def xtab(xt, child_cols, child_row, parent_link=False, parent_reason=False):
                     "<tr><td class=empty colspan=7>No target url recorded.</td></tr>", cmore)
         blocks += ("<details class=x><summary><span class=lbl>%s</span><span class=n>%s</span>"
                    "<span class=n>%s</span><span class=n>%s</span><span class=n>%s</span>"
-                   "<span class=n>%s</span><span class=n>%s</span></summary>%s</details>") % (
-            label, b["hits"], len(b["vis"]), b["valid"], b["failed"], hb(b["bytes"]), avgms(b), childtbl)
-    note = ("<p class=foot>Showing the top %d of %d.</p>" % (XPAR, len(items))) if len(items) > XPAR else ""
-    return "<div class=card>" + head + blocks + "</div>" + note
+                   "%s<span class=n>%s</span></summary>%s</details>") % (
+            label, b["hits"], len(b["vis"]), b["valid"], b["failed"], bspan(b["bytes"]), avgms(b),
+            childtbl)
+    note = ("<p class=foot>Showing the top %d of %d.</p>" % (XPAR, len(xt))) if len(xt) > XPAR else ""
+    return "<div class=\"card sortable\">" + head + blocks + "</div>" + note
 
 
 def child_url_row(uri, cb):
@@ -824,7 +1113,7 @@ CHILD_URL_COLS = ("<th>Target URL</th><th>Hits</th><th>Unique</th><th>Valid</th>
 
 
 def error_table(err):
-    items = sorted(err.items(), key=lambda kv: kv[1]["total"], reverse=True)
+    items = heapq.nlargest(FLATCAP, err.items(), key=lambda kv: kv[1]["total"])
     if not items:
         return "<div class=card><div class=empty>No failed requests in this window.</div></div>"
     shown = items[:FLATCAP]
@@ -842,7 +1131,7 @@ def error_table(err):
                  "<td>%s</td><td>%s</td><td>%s</td><td class=lbl>%s</td><td>%s</td></tr>") % (
             dlink(uri), bar(int(round(100.0 * e["total"] / mx))), e["total"], e["c4"], e["c5"],
             esc(ts_lbl), len(e["vis"]), ref_lbl, when(e["last"]))
-    return ("<div class=card><div class=tw><table><thead><tr><th>URL</th><th>Total Errors</th>"
+    return ("<div class=\"card sortable\"><div class=tw><table><thead><tr><th>URL</th><th>Total Errors</th>"
             "<th>4xx</th><th>5xx</th><th>Top Status</th><th>Unique</th><th>Top Referrer</th>"
             "<th>Last Seen</th></tr></thead><tbody>" + rows + "</tbody></table></div></div>")
 
@@ -871,18 +1160,25 @@ def trending_block(tnow, tprev, mode):
     for u, now, prev, delta, vis in rowdata:
         if prev == 0:
             pc = "<span class=dn0>new</span>"
+            # No prior hits is undefined growth, not zero, so it sorts as a huge percent.
+            pcs = 1e9
         else:
-            pc = "<span class=%s>%+.0f%%</span>" % ("up" if delta >= 0 else "down",
-                                                    delta / float(prev) * 100.0)
+            pcs = delta / float(prev) * 100.0
+            pc = "<span class=%s>%+.0f%%</span>" % ("up" if delta >= 0 else "down", pcs)
         dcls = "up" if delta >= 0 else "down"
-        rows += ("<tr><td class=lbl>%s</td><td>%s</td><td>%s</td><td class=%s>%+d</td><td>%s</td>"
-                 "<td>%s</td></tr>") % (dlink(u), now, prev, dcls, delta, pc, vis)
-    return ("<div class=card><div class=tw><table><thead><tr><th>URL</th><th>Hits now</th>"
+        rows += ("<tr><td class=lbl>%s</td><td>%s</td><td>%s</td><td class=%s>%+d</td>"
+                 "<td data-s=\"%.4f\">%s</td><td>%s</td></tr>") % (
+            dlink(u), now, prev, dcls, delta, pcs, pc, vis)
+    return ("<div class=\"card sortable\"><div class=tw><table><thead><tr><th>URL</th><th>Hits now</th>"
             "<th>Hits prev</th><th>Change</th><th>Percent</th><th>Unique</th></tr></thead><tbody>"
             + rows + "</tbody></table></div></div>")
 
 
-def trending_view(S, P):
+def trending_view(S, P, w):
+    if prev_short(w):
+        return ("<div class=card><div class=empty>Trending needs a full preceding %s to compare "
+                "against, and the log does not reach back that far yet.</div></div>"
+                % WLABEL[w].replace("last ", ""))
     return ("<h2>Rising</h2>" + trending_block(S["tnow"], P["tprev"], "rising") +
             "<h2>Fastest growing</h2>" + trending_block(S["tnow"], P["tprev"], "growth") +
             "<h2>Falling</h2>" + trending_block(S["tnow"], P["tprev"], "falling"))
@@ -898,11 +1194,11 @@ def content_table(mime):
     rows = ""
     for k, b in shown:
         avgb = int(b["bytes"] / b["hits"]) if b["hits"] else 0
-        rows += ("<tr><td class=lbl><span class=v>%s</span>%s</td><td>%s</td><td>%s</td><td>%s</td>"
-                 "<td>%s</td><td>%.1f%%</td></tr>") % (
+        rows += ("<tr><td class=lbl><span class=v>%s</span>%s</td><td>%s</td><td>%s</td>%s"
+                 "%s<td>%.1f%%</td></tr>") % (
             esc(k), bar(int(round(100.0 * b["hits"] / mx))), b["hits"], len(b["vis"]),
-            hb(b["bytes"]), hb(avgb), 100.0 * b["bytes"] / total_b)
-    return ("<div class=card><div class=tw><table><thead><tr><th>Content Type</th><th>Hits</th>"
+            bcell(b["bytes"]), bcell(avgb), 100.0 * b["bytes"] / total_b)
+    return ("<div class=\"card sortable\"><div class=tw><table><thead><tr><th>Content Type</th><th>Hits</th>"
             "<th>Unique</th><th>Bandwidth</th><th>Avg Bytes</th><th>% of Bandwidth</th></tr></thead>"
             "<tbody>" + rows + "</tbody></table></div></div>")
 
@@ -920,10 +1216,10 @@ def hosts_view(hosts):
         for ip, b in rows_items:
             rows += ("<tr><td class=lbl><span class=v>%s</span>%s</td><td class=lbl>%s</td>"
                      "<td class=lbl>%s</td><td>%s</td><td class=ok>%s</td><td class=bad>%s</td>"
-                     "<td>%s</td></tr>") % (
+                     "%s</tr>") % (
                 esc(ip), bar(int(round(100.0 * b["hits"] / mx))), esc(country_of(ip)),
-                esc(asn_of(ip)), b["hits"], b["valid"], b["failed"], hb(b["bytes"]))
-        return ("<h2>%s</h2><div class=card><div class=tw><table><thead><tr><th>IP</th><th>Country</th>"
+                esc(asn_of(ip)), b["hits"], b["valid"], b["failed"], bcell(b["bytes"]))
+        return ("<h2>%s</h2><div class=\"card sortable\"><div class=tw><table><thead><tr><th>IP</th><th>Country</th>"
                 "<th>Network</th><th>Hits</th><th>Valid</th><th>Failed</th><th>Bandwidth</th></tr>"
                 "</thead><tbody>%s</tbody></table></div></div>") % (title, rows)
 
@@ -950,7 +1246,7 @@ def entry_view(sess):
         rows += ("<tr><td class=lbl>%s%s</td><td>%s</td><td>%s</td><td>%.1f%%</td><td class=lbl>%s</td>"
                  "</tr>") % (dlink(u), bar(int(round(100.0 * e["n"] / mx))), e["n"], len(e["vis"]),
                             100.0 * e["n"] / total, src_lbl)
-    return ("<div class=card><div class=tw><table><thead><tr><th>Entry Page</th><th>Entrances</th>"
+    return ("<div class=\"card sortable\"><div class=tw><table><thead><tr><th>Entry Page</th><th>Entrances</th>"
             "<th>Unique</th><th>% of Entrances</th><th>Top Source</th></tr></thead><tbody>" + rows +
             "</tbody></table></div></div>")
 
@@ -968,7 +1264,7 @@ def exit_view(sess):
         rate = 100.0 * e["n"] / pv if pv else 0.0
         rows += ("<tr><td class=lbl>%s%s</td><td>%s</td><td>%s</td><td>%s</td><td>%.1f%%</td></tr>") % (
             dlink(u), bar(int(round(100.0 * e["n"] / mx))), e["n"], len(e["vis"]), pv, rate)
-    return ("<div class=card><div class=tw><table><thead><tr><th>Exit Page</th><th>Exits</th>"
+    return ("<div class=\"card sortable\"><div class=tw><table><thead><tr><th>Exit Page</th><th>Exits</th>"
             "<th>Unique</th><th>Pageviews</th><th>Exit Rate</th></tr></thead><tbody>" + rows +
             "</tbody></table></div></div>")
 
@@ -990,7 +1286,7 @@ def slow_view(slow):
                  "<td>%s</td><td>%s</td><td>%.1f%%</td></tr>") % (
             dlink(u), reqs, ms(avg), ms(percentile(s, 0.5)), ms(percentile(s, 0.95)),
             ms(max(s)), 100.0 * err / reqs if reqs else 0.0)
-    return ("<div class=card><div class=tw><table><thead><tr><th>URL</th><th>Requests</th>"
+    return ("<div class=\"card sortable\"><div class=tw><table><thead><tr><th>URL</th><th>Requests</th>"
             "<th>Avg ms</th><th>p50 ms</th><th>p95 ms</th><th>Max ms</th><th>Error %</th></tr></thead>"
             "<tbody>" + rows + "</tbody></table></div></div>")
 
@@ -1019,38 +1315,37 @@ def overview_view(w):
     ds = sorted(S["dsamp"])
     p95 = ms(percentile(ds, 0.95)) if ds else 0
     tiles = "".join([
-        tile("Unique Visitors", "{:,}".format(uv), fmt_delta(uv, len(P["vis"]))),
-        tile("Visits", "{:,}".format(vis), fmt_delta(vis, P.get("visits", 0))),
-        tile("Pageviews", "{:,}".format(pv), fmt_delta(pv, P["page"])),
-        tile("Total Requests", "{:,}".format(tot), fmt_delta(tot, P["total"])),
-        tile("Error Rate", "%.1f%%" % errrate, fmt_delta(errrate, perrrate, invert=True)),
+        tile("Unique Visitors", "{:,}".format(uv), fmt_delta(uv, len(P["vis"]), w=w)),
+        tile("Visits", "{:,}".format(vis), fmt_delta(vis, P.get("visits", 0), w=w)),
+        tile("Pageviews", "{:,}".format(pv), fmt_delta(pv, P["page"], w=w)),
+        tile("Total Requests", "{:,}".format(tot), fmt_delta(tot, P["total"], w=w)),
+        tile("Error Rate", "%.1f%%" % errrate, fmt_delta(errrate, perrrate, invert=True, w=w)),
         tile("Avg Response", "%d ms" % avg, ""),
         tile("p95 Response", "%d ms" % p95, ""),
-        tile("Bandwidth", hb(S["bytes"]), fmt_delta(S["bytes"], P["bytes"])),
+        tile("Bandwidth", hb(S["bytes"]), fmt_delta(S["bytes"], P["bytes"], w=w)),
     ])
     tiles = "<div class=tiles>%s</div>" % tiles
 
     def top5(d, keyf=lambda kv: kv[1]["hits"], link=False):
-        it = sorted(d.items(), key=keyf, reverse=True)[:5]
+        it = heapq.nlargest(5, d.items(), key=keyf)
         r = ""
         for k, b in it:
             val = dlink(k) if link else "<span class=v>%s</span>" % esc(k)
             h = b["hits"] if isinstance(b, dict) and "hits" in b else b
-            # title carries the untruncated value, since these cards ellipsis long urls to fit.
             r += "<tr><td class=lbl title=\"%s\">%s</td><td>%s</td></tr>" % (esc(k), val, h)
         return r
     pages = top5(S["flat"]["requests"], link=True)
     refs = ""
-    for k, e in sorted(S["xref"].items(), key=lambda kv: kv[1]["b"]["hits"], reverse=True)[:5]:
+    for k, e in heapq.nlargest(5, S["xref"].items(), key=lambda kv: kv[1]["b"]["hits"]):
         refs += "<tr><td class=lbl title=\"%s\"><span class=v>%s</span></td><td>%s</td></tr>" % (
             esc(k), esc(k), e["b"]["hits"])
     errs = ""
-    for u, e in sorted(S["err"].items(), key=lambda kv: kv[1]["total"], reverse=True)[:5]:
+    for u, e in heapq.nlargest(5, S["err"].items(), key=lambda kv: kv[1]["total"]):
         errs += "<tr><td class=lbl title=\"%s\">%s</td><td class=bad>%s</td></tr>" % (
             esc(u), dlink(u), e["total"])
     ctry = top5(S["flat"]["geo"])
     entries = ""
-    for u, e in sorted(SESS[w]["entry"].items(), key=lambda kv: kv[1]["n"], reverse=True)[:5]:
+    for u, e in heapq.nlargest(5, SESS[w]["entry"].items(), key=lambda kv: kv[1]["n"]):
         entries += "<tr><td class=lbl title=\"%s\">%s</td><td>%s</td></tr>" % (
             esc(u), dlink(u), e["n"])
     lists = ("<div class=grid2>"
@@ -1065,10 +1360,6 @@ def overview_view(w):
 
 # ---- detail.json + detail.html -----------------------------------------------------------------
 def build_detail_json():
-    # Statistics come from the broad per uri accumulator, so every uri seen often enough gets a
-    # record, assets and API endpoints included. Navigation comes from the pageview walk and is
-    # merged in only where it exists: computing it over all requests would bury each page's real
-    # next hop under its own CSS, JS and images.
     out = {}
     udet = CUR["weekly"]["udet"]
     if not udet:
@@ -1093,12 +1384,9 @@ def build_detail_json():
             "meth": [[str(k), v] for k, v in top(u["meth"], DETAIL_ROWS)],
             "ctry": [[str(k), v] for k, v in top(u["ctry"], DETAIL_ROWS)],
         }
-        # lets the page hide the navigation section rather than drawing empty cards
         rec["nav"] = 1 if (rec["prev"] or rec["next"] or rec["ext"]) else 0
 
-        # Everything below is omitted when empty rather than written as an empty list. That is what
-        # keeps the file a sane size: most uris have no errors and no referrer, and this is written
-        # for every scope on every regen.
+        # Omitted when empty rather than written as an empty list, which keeps this file small.
         if u["asn"]:
             rec["asn"] = [[str(k), v] for k, v in top(u["asn"], DETAIL_ROWS)]
         if u["refs"]:
@@ -1133,13 +1421,13 @@ __FAVICON__
 __STYLE__
 <div class=wrap>
 <h1>Page detail</h1>
-<p class=foot id=foot style="display:none">Before and after navigation is approximated from client IP and time, over the last 7 days.</p>
+<p class=foot id=foot style="display:none">Before and after navigation is approximated from client IP and time, over __WLABEL__.</p>
 <div id=body><div class=card><div class=empty>Loading.</div></div></div>
 </div>
 <script>
 function esc(s){return String(s).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
-// Every list carries a line saying what it counts. A bare heading leaves you guessing whether a
-// number is hits, visitors or sessions.
+// Every list carries a line saying what it is counting. A bare heading leaves you guessing whether
+// a number is hits, visitors or sessions.
 function list(title,arr,note){var r='<div class=card><h2 style="margin-top:0">'+title+'</h2>';
 if(note){r+='<p class=foot style="margin:-6px 0 10px">'+note+'</p>';}
 if(!arr||!arr.length){return r+'<div class=empty>None.</div></div>';}
@@ -1162,7 +1450,7 @@ var uri=decodeURIComponent(location.hash.slice(1));
 if(!uri){document.querySelector('h1').textContent='Page detail';el.innerHTML='<div class=card><div class=empty>Open this page by clicking a URL on any panel.</div></div>';return;}
 document.querySelector('h1').textContent=uri;
 var d=PAGES?PAGES[uri]:null;
-if(!d){ft.style.display='none';el.innerHTML='<div class=card><div class=empty>No detail recorded for this URL. A URL needs at least two hits in the last 7 days to get a record.</div></div>';return;}
+if(!d){ft.style.display='none';el.innerHTML='<div class=card><div class=empty>No detail recorded for this URL. A URL needs at least two hits in __WLABEL__ to get a record.</div></div>';return;}
 ft.style.display=d.nav?'':'none';
 var e=d.err;
 var tiles='<div class=tiles>'
@@ -1176,7 +1464,7 @@ tiles+='</div>';
 
 var out=tiles;
 
-// Activity first: it frames everything below by showing when the traffic actually happened.
+// Activity first: it frames everything below it by showing when the traffic actually happened.
 if(d.days&&d.days.length){
   var dm=0;d.days.forEach(function(x){if(x[1]>dm)dm=x[1];});
   var rows='';
@@ -1239,18 +1527,16 @@ def views_from(fn):
     return {w: fn(w) for w in WINS}
 
 
-# Overview
 write("index.html", page(TITLE + " : Overview", views_from(overview_view),
       "Numbers compare the current window to the one before it. Visits are sessions approximated from "
       "client IP and timestamp gaps of 30 minutes, over all activity including bots. Entry and Exit "
       "pages are based on page views only. " + FOOT_BASE))
 
-# Flat field panels
 FLAT_PAGES = [
     ("requests", "Requested Files", False, True),
     ("static", "Static Files", False, True),
     ("not_found", "404 Not Found", False, True),
-    ("mime", "Content Types", False, False),   # replaced below by content_table, kept for safety
+    ("mime", "Content Types", False, False),   # skipped below, rendered by content_table instead
     ("tls", "TLS Versions", False, False),
     ("vhosts", "Virtual Hosts", False, False),
     ("geo", "Geo Location", False, False),
@@ -1262,29 +1548,36 @@ FLAT_PAGES = [
 for key, label, by_key, link in FLAT_PAGES:
     if key == "mime":
         continue
-    # Geo and ASN carry the DB-IP credit. Their licence (CC BY 4.0) requires it to stay visible.
     foot = (FOOT_BASE + " " + DBIP_CREDIT) if key in ("geo", "asn") else FOOT_BASE
     write(key + ".html", page(TITLE + " : " + label,
           {w: flat_table(CUR[w]["flat"][key], by_key, link) for w in WINS}, foot))
 
-# Visitors (IPs) with country/network + offenders
 write("hosts.html", page(TITLE + " : Visitors (IPs)",
       {w: hosts_view(CUR[w]["flat"]["hosts"]) for w in WINS},
       "The offenders table ranks IPs by failed requests, which surfaces scanners and abuse. "
       + FOOT_BASE + " " + DBIP_CREDIT))
 
-# Content Types with bandwidth
 write("content_types.html", page(TITLE + " : Content Types",
       {w: content_table(CUR[w]["flat"]["mime"]) for w in WINS},
       "Bandwidth is the sum of response sizes. " + FOOT_BASE))
 
-# Cross tabs
 write("referrers.html", page(TITLE + " : Referrers",
       {w: xtab(CUR[w]["xref"], CHILD_URL_COLS, child_url_row) for w in WINS},
-      "Expand a referrer to see which pages on your site it drove traffic to. " + FOOT_BASE))
+      "Outside sites only: our own domains are on the Internal Referrers page. Expand a referrer to "
+      "see which pages on your site it drove traffic to. " + FOOT_BASE))
 write("ref_sites.html", page(TITLE + " : Referring Sites",
       {w: xtab(CUR[w]["xsite"], CHILD_URL_COLS, child_url_row) for w in WINS},
-      "The domain rollup of Referrers. Expand a site to see the landing pages it sent. " + FOOT_BASE))
+      "The domain rollup of Referrers, outside sites only. Expand a site to see the landing pages it "
+      "sent. " + FOOT_BASE))
+write("referrers_internal.html", page(TITLE + " : Internal Referrers",
+      {w: xtab(CUR[w]["xref_int"], CHILD_URL_COLS, child_url_row) for w in WINS},
+      "Links from our own domains (" + (", ".join(INTERNAL_DOMAINS) or "none configured") + ") and "
+      "their subdomains, so one page linking to another shows up here rather than as outside traffic. "
+      + FOOT_BASE))
+write("ref_sites_internal.html", page(TITLE + " : Internal Sites",
+      {w: xtab(CUR[w]["xsite_int"], CHILD_URL_COLS, child_url_row) for w in WINS},
+      "The domain rollup of Internal Referrers. Expand a site to see the landing pages it sent. "
+      + FOOT_BASE))
 write("status.html", page(TITLE + " : Status Codes",
       {w: xtab(CUR[w]["xstatus"], CHILD_URL_COLS, child_url_row, parent_reason=True) for w in WINS},
       "Expand a status code to see exactly which URLs produced it, ranked. " + FOOT_BASE))
@@ -1293,19 +1586,16 @@ write("methods.html", page(TITLE + " : HTTP Methods",
       "Expand a method to see its top endpoints. Write methods (POST, PUT, PATCH, DELETE) reveal "
       "form and API traffic and scan patterns. " + FOOT_BASE))
 
-# Error pages
 write("error_pages.html", page(TITLE + " : Error Pages",
       {w: error_table(CUR[w]["err"]) for w in WINS},
       "URLs that returned status 400 and above, ranked by total errors. 5xx are server side, 4xx are "
       "client or missing. Top Referrer separates a broken inbound link from your own bug. " + FOOT_BASE))
 
-# Trending
 write("trending.html", page(TITLE + " : Trending",
-      {w: trending_view(CUR[w], PRV[w]) for w in WINS},
+      {w: trending_view(CUR[w], PRV[w], w) for w in WINS},
       "Non static successful GET requests, this window versus the one before it. Rising is by absolute "
       "change, Fastest growing by percent, Falling flags pages that dropped off. " + FOOT_BASE))
 
-# Sessions
 write("entry.html", page(TITLE + " : Entry Pages",
       {w: entry_view(SESS[w]) for w in WINS},
       "The first page of each visit. Sessions are approximated from client IP and 30 minute gaps. " + FOOT_BASE))
@@ -1314,16 +1604,146 @@ write("exit.html", page(TITLE + " : Exit Pages",
       "The last page of each visit, with exit rate as exits over pageviews. Approximated from client "
       "IP and 30 minute gaps. " + FOOT_BASE))
 
-# Slow endpoints
 write("slow.html", page(TITLE + " : Slowest Endpoints",
       {w: slow_view(CUR[w]["slow"]) for w in WINS},
       "Server response time in milliseconds, not visitor dwell time. p95 means 95 percent of requests "
       "were faster than this. Only URLs with at least 5 requests are shown. " + FOOT_BASE))
 
-# Per page detail
 detail_json = build_detail_json()
 write("detail.json", json.dumps({"pages": detail_json}))
-# detail.html reads detail.json['pages'] at runtime
 DETAIL_PAGE = (DETAIL_HTML.replace("__TITLE__", esc(TITLE + " : Page detail"))
+               .replace("__WLABEL__", detail_wlabel())
                .replace("__FAVICON__", FAVICON).replace("__STYLE__", STYLE))
 write("detail.html", DETAIL_PAGE)
+
+
+# ---- time breakdown (time.html) -------------------------------------------------------------------
+def t_week_label(wk):
+    try:
+        mon = time.strftime("%Y-%m-%d", time.strptime(wk + "-1", "%G-W%V-%u"))
+        return "Week of " + mon + " (" + wk + ")"
+    except Exception:
+        return wk
+
+
+def t_table(buckets, order, labelfn):
+    mx = max((buckets[k]["hits"] for k in order), default=0) or 1
+    th = tva = tf = tb = 0
+    tv = set()
+    body = ""
+    for k in order:
+        b = buckets[k]
+        th += b["hits"]
+        tv |= b["vis"]
+        tva += b["valid"]
+        tf += b["failed"]
+        tb += b["bytes"]
+        pct = int(round(100.0 * b["hits"] / mx))
+        body += (
+            "<tr><td class=lbl>{lab}<span class=bar style='width:{pct}%'></span></td>"
+            "<td>{hits}</td><td>{uniq}</td><td class=ok>{ok}</td>"
+            "<td class=bad>{bad}</td><td>{bw}</td></tr>"
+        ).format(lab=html.escape(labelfn(k)), pct=pct, hits=b["hits"],
+                 uniq=len(b["vis"]), ok=b["valid"], bad=b["failed"], bw=hb(b["bytes"]))
+    foot = (
+        "<tr class=tot><td class=lbl>Total</td><td>{h}</td><td>{u}</td>"
+        "<td class=ok>{v}</td><td class=bad>{f}</td><td>{bw}</td></tr>"
+    ).format(h=th, u=len(tv), v=tva, f=tf, bw=hb(tb))
+    return (
+        "<div class=tw><table><thead><tr><th>Bucket</th><th>Hits</th><th>Unique Visitors</th>"
+        "<th>Valid Requests</th><th>Failed Requests</th><th>Bandwidth</th></tr></thead>"
+        "<tbody>" + body + foot + "</tbody></table></div>"
+    )
+
+
+def t_heatmap():
+    mx = max((t_heat[d][h] for d in range(7) for h in range(24)), default=0) or 1
+    cols = "".join("<th>%02d</th>" % h for h in range(24))
+    rows = ""
+    for d in range(7):
+        cells = ""
+        for h in range(24):
+            v = t_heat[d][h]
+            inten = v / mx
+            if v:
+                bg = "background:rgba(111,76,255,%.3f)" % (0.08 + inten * 0.82)
+            else:
+                bg = "background:rgba(255,255,255,.02)"
+            label = str(v) if inten >= 0.15 else ""
+            cells += "<td class=hc style='%s' title='%s %02d:00, %d hits'>%s</td>" % (
+                bg, DOW[d], h, v, label)
+        rows += "<tr><th class=hd>%s</th>%s</tr>" % (DOW[d][:3], cells)
+    return ("<div class=tw><table class=heat><thead><tr><th></th>" + cols +
+            "</tr></thead><tbody>" + rows + "</tbody></table></div>")
+
+
+TIME_PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>time breakdown</title>
+<link rel="icon" type="image/x-icon" href="data:image/x-icon;base64,AAABAAEAEBAQAAEABAAoAQAAFgAAACgAAAAQAAAAIAAAAAEABAAAAAAAgAAAAAAAAAAAAAAAEAAAAAAAAADGxsYAWFhYABwcHABfAP8A/9dfAADXrwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIiIiIiIiIiIjMlUkQgAiIiIiIiIiIiIiIzJVJEIAAAIiIiIiIiIiIiMyVSRCAAIiIiIiIiIiIiIRERERERERERERERERERERIiIiIiIiIiIgACVVUiIiIiIiIiIiIiIiIAAlVVIiIiIiIiIiIiIiIhEREREREREREREREREREREAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA">
+<style>
+""" + FONT_CSS + """
+*{box-sizing:border-box}
+body{font-family:'Roboto',system-ui,sans-serif;min-height:100vh;margin:0;padding:4.4rem 1.2rem 3rem;color:#e8e8f0;background:radial-gradient(1100px 600px at 50% -10%,rgba(111,76,255,.16),transparent 60%),radial-gradient(900px 500px at 88% 6%,rgba(1,110,218,.12),transparent 55%),radial-gradient(800px 480px at 10% 16%,rgba(217,0,192,.08),transparent 55%),#04050c}
+.wrap{max-width:1000px;margin:0 auto}
+h1{font-weight:900;font-size:1.7rem;margin:0 0 .2rem}
+.sub{color:rgba(255,255,255,.55);margin:0 0 1.4rem;font-size:.9rem}
+.seg{display:inline-flex;gap:4px;background:rgba(13,14,33,.6);border:1px solid rgba(255,255,255,.1);border-radius:999px;padding:4px;margin:0 0 1.4rem}
+.segbtn{background:none;border:none;color:rgba(255,255,255,.7);font:600 13px Roboto,system-ui,sans-serif;padding:7px 20px;border-radius:999px;cursor:pointer;transition:.2s}
+.segbtn.active{background:linear-gradient(90deg,#016eda,#d900c0);color:#fff}
+.segbtn:hover:not(.active){color:#fff}
+.card{background:rgba(13,14,33,.85);border:1px solid rgba(255,255,255,.09);border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.45);padding:1.2rem 1.3rem;margin:0 0 1rem}
+.card h2{font-weight:700;font-size:.82rem;letter-spacing:.09em;text-transform:uppercase;color:rgba(255,255,255,.55);margin:0 0 1rem}
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:.92rem}
+th{text-align:right;color:rgba(255,255,255,.5);font-weight:500;padding:.5rem .6rem;border-bottom:1px solid rgba(255,255,255,.12)}
+th:first-child{text-align:left}
+td{text-align:right;padding:.45rem .6rem;border-bottom:1px solid rgba(255,255,255,.06)}
+td.lbl{text-align:left;position:relative;white-space:nowrap;color:#fff}
+td.ok{color:#8fffca}
+td.bad{color:#ff9db2}
+.bar{position:absolute;left:0;bottom:2px;height:3px;border-radius:2px;background:linear-gradient(90deg,#016eda,#d900c0);opacity:.85}
+tr.tot td{font-weight:700;color:#cfe0ff;border-top:1px solid rgba(255,255,255,.14)}
+tr:hover td{background:rgba(111,76,255,.08)}
+table.heat{font-size:.7rem;border-collapse:separate;border-spacing:2px}
+table.heat th{padding:.2rem .25rem;color:rgba(255,255,255,.4);font-weight:500;border:none}
+table.heat th.hd{text-align:right;color:rgba(255,255,255,.65)}
+table.heat td.hc{min-width:26px;text-align:center;color:#fff;padding:.35rem .2rem;border:none;border-radius:4px}
+table.heat tr:hover td{background:inherit}
+.foot{color:rgba(255,255,255,.4);font-size:.78rem;margin-top:1.4rem;line-height:1.6}
+</style>
+<div class=wrap>
+<h1>Time breakdown</h1>
+<p class=sub>__SUB__</p>
+<div class=seg>
+<button class="segbtn active" data-view=daily>Daily</button>
+<button class="segbtn" data-view=weekly>Weekly</button>
+<button class="segbtn" data-view=monthly>Monthly</button>
+</div>
+<div class=view id=view-daily><div class=card><h2>Daily (__LDAY__): visits by hour of day</h2>__HOUR__</div></div>
+<div class=view id=view-weekly hidden><div class=card><h2>Weekly (__LWEEK__): visits by day of week</h2>__DAY__</div></div>
+<div class=view id=view-monthly hidden><div class=card><h2>Monthly (__LMON__): visits by week</h2>__WEEK__</div></div>
+<div class=card><h2>Heatmap (__LMON__): day of week by hour, colored by hits</h2>__HEAT__</div>
+<p class=foot>Daily is the last 24 hours by hour, Weekly the last 7 days by day of week, Monthly the last 30 days by week, or as much of each as the log holds: a heading that says only N collected is covering less than its full window, and a dark cell there means no data rather than a quiet hour. The heatmap sums hits by weekday and hour over the last 30 days, so brighter cells are busier times. All traffic including bots, so totals run higher than the humans only chart dashboard. Times in server local time. Valid Requests are responses with status under 400, Failed Requests are status 400 and above.</p>
+</div>
+<script>
+(function(){
+var btns=document.querySelectorAll('.segbtn');var V=['daily','weekly','monthly'];
+function show(v){V.forEach(function(x){document.getElementById('view-'+x).hidden=(x!==v);});
+btns.forEach(function(b){b.classList.toggle('active',b.getAttribute('data-view')===v);});
+try{localStorage.setItem('hailsTimeView',v);}catch(e){}}
+btns.forEach(function(b){b.onclick=function(){show(b.getAttribute('data-view'));};});
+var saved='daily';try{saved=localStorage.getItem('hailsTimeView')||'daily';}catch(e){}
+if(V.indexOf(saved)<0)saved='daily';show(saved);
+})();
+</script>
+<script src="/nav.js"></script>
+"""
+
+write("time.html", TIME_PAGE.replace("__SUB__", html.escape(TITLE))
+      .replace("__LDAY__", wlabel("daily", "last 24 hours"))
+      .replace("__LWEEK__", wlabel("weekly", "last 7 days"))
+      .replace("__LMON__", wlabel("monthly", "last 30 days"))
+      .replace("__HOUR__", t_table(t_hours, list(range(24)), lambda h: "%02d:00" % h))
+      .replace("__DAY__", t_table(t_days, list(range(7)), lambda d: DOW[d]))
+      .replace("__WEEK__", t_table(t_weeks, sorted(t_weeks.keys()), t_week_label))
+      .replace("__HEAT__", t_heatmap()))

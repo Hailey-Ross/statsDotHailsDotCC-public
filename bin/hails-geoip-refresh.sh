@@ -1,7 +1,6 @@
 #!/bin/bash
-# Refresh the DB-IP free GeoIP databases (country and asn) to the current month and repoint the
-# stable symlinks that goaccess.conf reads. Run monthly by hails-geoip.timer.
-# Safe to rerun: it skips a month it already has and keeps the existing db if a fetch fails.
+# Refreshes the DB-IP free databases to the current month and repoints the stable symlinks that
+# goaccess.conf reads. Run monthly by hails-geoip.timer, and safe to rerun by hand.
 set -u
 install -d /var/lib/GeoIP
 M=$(date +%Y-%m)
@@ -15,7 +14,6 @@ for kind in country asn; do
     fi
   fi
   [ -s "/var/lib/GeoIP/$f" ] && ln -sf "/var/lib/GeoIP/$f" "/var/lib/GeoIP/dbip-${kind}.mmdb"
-  # Keep only the two newest monthly files per kind.
   ls -1t /var/lib/GeoIP/dbip-${kind}-lite-*.mmdb 2>/dev/null | tail -n +3 | xargs -r rm -f
 done
 ls -l /var/lib/GeoIP/dbip-country.mmdb /var/lib/GeoIP/dbip-asn.mmdb 2>/dev/null

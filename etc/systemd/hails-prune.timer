@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily prune of aged events and unreferenced dimension rows in the hails warehouse
+
+[Timer]
+# Runs after the verify. The prune deletes whole days and the verify only compares days that still
+# have events, which is what keeps the two from tripping over each other.
+OnCalendar=*-*-* 03:45:00
+Persistent=false
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

@@ -34,6 +34,9 @@ Most pages have a Daily, Weekly and Monthly switcher, meaning the last 24 hours,
 and your choice follows you around. Bandwidth is the odd one out: its switcher changes the bucket size
 rather than the window.
 
+Every list sorts and pages. Click a heading to sort by it, shift click to add a second key, and long
+lists break into pages rather than running for a screen and a half.
+
 ### Page detail, my favourite bit
 
 Every URL on every panel is a link. Click one and you get a report on that resource:
@@ -58,14 +61,35 @@ The drilldown uses the weekly window, so its numbers cover 7 days even when the 
 ### Scanners
 
 People are already walking lists of paths at your server looking for `.env` and `wp-login.php`. That
-is normal.
+is normal, and there is more of it than you expect.
 
-They stay in every count, but they are kept out of the navigation lists where they would drown out
-real journeys. They are spotted structurally, by the redirect a site sends when it bounces an unknown
-path to its homepage, with a short list of known probe paths as backup.
+They stay in every count, because they really were served and they really did cost you bandwidth.
+What they lose is their identity. A matched request has its url replaced with a single `/(probe)` row
+and its `Referer` header dropped, so a day of scanning contributes one line to your Requested Files
+panel instead of several hundred.
+
+Dropping the referrer is the half that surprises people. Scanners forge one, and they pick something
+plausible, so without this you get a referrer panel confidently telling you that a site you have
+never heard of is linking to you. It is convincing enough to send you looking for a link that does
+not exist.
+
+Tokens match a path segment rather than a substring, which is what stops a rule from swallowing a
+real url of yours that happens to contain the same letters. Set `HAILS_PROBE_PATHS` to change the
+list, or to `none` to turn it off. Before you change it, try it as a dry run:
+
+```bash
+zcat -f /var/log/caddy/access.log* | hails-stats-pre.py --probe-report
+```
+
+That prints what would be masked, grouped by token, with the status codes each one matched, and
+writes nothing. Read the status column rather than the hit count: anything of yours answering 2xx is
+a false positive, and masking is not reversible.
+
+There is a second layer if you want it. `etc/caddy/block_probes.snippet` refuses the same paths at
+the edge with a 403, so they never reach your backends at all.
 
 If a whole host is mostly noise, `HAILS_AGG_EXCLUDE` keeps it out of the All domains view while it
-keeps its own per domain pages.
+keeps its own per domain pages, and `HAILS_DROP_HOSTS` removes it from the pipeline entirely.
 
 ### Numbers that look wrong
 
@@ -75,6 +99,10 @@ all traffic. The two will not agree, on purpose.
 **Bandwidth counts response bodies only.** It will always read lower than what your host bills you.
 
 **Time Served is your response time**, not how long anyone read the page. A log cannot tell you that.
+
+**The long windows start empty.** The warehouse only knows what it has seen since you installed it,
+so a Weekly view needs a week and a Monthly needs a month. Until then those pages say they are still
+collecting rather than showing you a confident number built from two days.
 
 ## Before you start
 
@@ -163,27 +191,52 @@ your other sites down.
 ```
 /var/log/caddy/access.log
         |
-        |  hails-stats-pre.py     normalizes the JSON for GoAccess
+        |  hails-ingest.py        every 5 minutes, reads only what is new
         v
-   goaccess + the Python generators
+   /var/lib/hails-stats/events.db      the durable record
         |
+        |  hails-panels.py        every 15 minutes, plus goaccess for its own dashboard
         v
    /srv/stats/{index.html, all/, d/<domain>/}      served by Caddy behind basic auth
-        ^
-        |  rebuilt every 5 minutes by hails-stats.timer
 ```
+
+The warehouse is the source and the log is the fallback. If the ingest ever stalls, the pages notice
+that the newest event has gone stale and quietly rebuild from the log for that run instead, so a
+broken ingest costs you freshness rather than a dashboard full of zeroes.
 
 `hails-perf-collect.py` runs continuously, sampling `/proc` every 10 seconds so the Performance page
 has real history. Under 20 MB of memory and about a hundredth of a core.
 
-`/srv/stats` is rebuilt from the log every 5 minutes and is completely disposable. Two things are not,
-and they live in `/var/lib/hails-stats`:
+`/srv/stats` is rebuilt on every regen and is completely disposable. Three things are not, and they
+live in `/var/lib/hails-stats`:
 
+* `events.db`, every request kept as a row, with per day and per hour summaries kept forever
 * `bandwidth.json`, the long term bandwidth history
 * `perf_*.bin`, the performance rings
 
-Your logs roll away in about two months and neither can be reconstructed afterwards, so do not delete
-that directory unless you mean to lose the history.
+Your logs roll away in weeks and none of this can be reconstructed afterwards, so do not delete that
+directory unless you mean to lose the history.
+
+### Why there is a database
+
+The log is the only thing you start with, and it is not enough. Caddy rotates it, so however much you
+keep, a Monthly view eventually asks for days that are simply gone. Reading the whole corpus on every
+rebuild also gets slower exactly as your history gets more interesting.
+
+So every request becomes a row, once. Summaries are folded per day and per hour and kept forever,
+while the raw rows age out at 90 days, which means the long windows outlive both the log and the raw
+data behind them. Strings are interned, so a country or a browser is worked out once per distinct
+value rather than once per request.
+
+Three timers keep the warehouse honest:
+
+* `hails-ingest.timer` pulls new lines in every 5 minutes, from a cursor, so it never double counts
+* `hails-verify.timer` recomputes the numbers straight from the logs each night and compares. It
+  fails loudly rather than logging quietly, so `systemctl --failed` is where a disagreement shows up
+* `hails-prune.timer` drops aged rows and any interned value nothing points at any more
+
+You can run the verify by hand any time with `hails-verify.py`. Agreement means the warehouse and
+your raw logs tell the same story.
 
 ## Configuration
 
@@ -193,13 +246,26 @@ Everything machine specific is in `/etc/hails-stats/config.env`:
 |---|---|
 | `HAILS_PERF_DISK` | Comma separated disks to chart. Found for you, so this is only for pinning the list by hand |
 | `HAILS_PERF_NIC` | Comma separated interfaces. Physical ones are found for you, docker bridges and veths skipped |
+| `HAILS_PERF_INTERVAL` | Seconds between `/proc` samples. Unset means 10 |
 | `HAILS_PERF_UNITS` | systemd units to show on the Performance page |
 | `HAILS_PERF_TARGETS` | Sites to probe for uptime, as `name\|url\|healthy codes` separated by semicolons |
+| `HAILS_PERF_HTTP` | Seconds between uptime probes. Unset means 300 |
+| `HAILS_PERF_LOCAL` | Seconds between systemd and docker reads. Unset means 300 |
 | `HAILS_MAP_ORG` | Name shown on the network map |
-| `HAILS_MAP_PUBLIC_HOST` | Also publish a sanitized public copy of the map. Unset means only the private one |
-| `HAILS_SERVED_ROOT` | Where to write `served.js` for the requests served counter. Unset means nothing is written |
+| `HAILS_MAP_PORTSVC` | Friendly labels for the localhost ports you proxy to, as `port\|label`, comma separated |
+| `HAILS_MAP_PUBLIC_HOST` | Also publish a sanitised public copy of the map. Unset means only the private one |
+| `HAILS_MAP_CANON` | Canonical URL for that public copy |
 | `HAILS_AGG_EXCLUDE` | Hosts to keep out of the All domains view, prefix matched. Each keeps its own per domain pages |
+| `HAILS_DROP_HOSTS` | Hosts removed from the pipeline entirely, prefix matched. No pages, and nothing stored |
+| `HAILS_PROBE_PATHS` | Scanner paths to mask. Unset uses the built in list, `none` turns masking off |
+| `HAILS_INTERNAL_DOMAINS` | Your own domains, so referrals between them split onto the Internal pages. Unset means every referrer is external |
+| `HAILS_EVENT_DAYS` | Days of raw events to keep. Unset means 90, and anything under 62 is raised to 62 |
+| `HAILS_DB_STALE_S` | How stale the warehouse may be before the pages fall back to the log. Unset means 1800 |
+| `HAILS_SERVED_ROOT` | Where to write `served.js` for the requests served counter. Unset means nothing is written |
+| `HAILS_SERVED_BASELINE` | Head start added to that counter. Unset means zero |
 | `HAILS_FONT_BASE` | Where the stylesheets look for the bundled Roboto. Unset means `/fonts`, same origin, which needs no CORS |
+| `HAILS_PERF_DIR` | Where the durable history lives. Unset means `/var/lib/hails-stats` |
+| `HAILS_ROLLUP` | Path to the bandwidth rollup. Unset means `bandwidth.json` inside that directory |
 
 Set the uptime status codes each site actually returns, not just 200. Plenty of healthy sites answer a
 redirect or an auth challenge on their root and will otherwise look dead forever:
@@ -283,6 +349,14 @@ known one, see `etc/linkstack/docker-compose.yml`.
 
 **Service state looks stale.** systemd and docker are polled every 5 minutes. The `/proc` metrics are
 10 seconds fresh.
+
+**`hails-verify.service` is in `systemctl --failed`.** That is it doing its job: the warehouse and
+your logs disagree about something. Run `hails-verify.py` by hand to see which check fell over. It
+prints what it compared and what it found, and it is safe to run any time since it only reads.
+
+**Numbers stopped moving.** Look at `systemctl status hails-ingest.service` first. If the ingest has
+stalled, the pages fall back to reading the log and carry on, so the symptom is usually staleness in
+the long windows rather than an obvious error.
 
 ## What is public and what is not
 

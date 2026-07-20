@@ -1,26 +1,10 @@
 #!/usr/bin/env python3
-# The Performance page: htop like statistics for the VPS itself.
-#
-#   python3 hails-perf.py "<TITLE>" "<OUTDIR>"
-#
-# Reads the durable rings written by hails-perf-collect.py (NOT the access log, and nothing on
-# stdin) and writes perf.html into OUTDIR. Machine wide, so it is generated once into the aggregate
-# scope only: none of this data is per domain.
-#
-# The shape of the page follows perf_meta.json, which lists the entities the collector found, so a
-# resized box grows a CPU column, a Disk IO card or a Storage card on its own with no edit here.
-#
-# No Daily/Weekly/Monthly switcher and no localStorage key: every window is a column and they are all
-# shown at once. That also keeps it clear of the shared hailsTimeView key, which resets to daily on
-# any value it does not recognise.
-#
-# Self contained by repo convention, carrying its own STYLE, FAVICON and helpers.
-#
-# No dash punctuation in page text: commas and colons only.
+# The Performance page:  python3 hails-perf.py "<TITLE>" "<OUTDIR>"
+# Reads the rings written by hails-perf-collect.py, never the access log, and writes perf.html into
+# OUTDIR. Machine wide, so it is generated into the aggregate scope only.
+# The shape of the page follows perf_meta.json, so a resized box grows a column or a card on its own.
 import sys, os, json, html, time, struct, calendar
 
-# Roboto is bundled rather than fetched from Google, so no page makes a third party call.
-# One variable file per subset covers every weight from 100 to 900.
 FONT_BASE = os.environ.get("HAILS_FONT_BASE", "/fonts").rstrip("/")
 FONT_CSS = (
     "@font-face{font-family:'Roboto';font-style:normal;font-weight:100 900;font-display:swap;src:url(%s/roboto-latin-ext.woff2) format('woff2');unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}"
@@ -168,8 +152,6 @@ def read_ring(group, entity, tier):
     return out
 
 
-# The collector records when it first ran. Falling back to the oldest RAW sample rather than a
-# rollup, whose timestamp is its bucket start and would claim coverage the data does not have.
 if not SINCE:
     raw = read_ring("sys", None, "raw")
     SINCE = raw[0][0] if raw else 0
@@ -311,7 +293,6 @@ def build():
     nics = entities("net")
     ncore = max(1, len(cores))
 
-    # Tiles. Disk shows the root filesystem, which is the one people mean by "is it full".
     root = "/" if "/" in fses else (fses[0] if fses else None)
     uptime = SVC.get("uptime") or 0
     tiles = [tile("VPS uptime", esc(dur(uptime)), "since %s" % esc(stamp(SVC.get("boot"))))]
@@ -358,7 +339,6 @@ def build():
                   ("mem_pct", pct, MAX), ("swap_used", hb, MEAN)],
                  barmetric="mem_pct")))
 
-    # CPU: the aggregate and steal come from sys, each core from its own ring.
     head = ["Window", "All cores"] + [c.replace("cpu", "Core ") for c in cores] + ["Steal", "IO wait"]
     crows = []
     for w in W8:
@@ -380,7 +360,6 @@ def build():
         "so adding cores does not disturb the rest of this page.",
         head, crows))
 
-    # One card per disk, so a new disk simply appears.
     for dsk in disks:
         out.append(section(
             "Disk IO", "Utilisation is the share of wall clock time the disk had at least one "
@@ -393,8 +372,6 @@ def build():
                      barmetric="util"),
             sub=dsk))
 
-    # One card per interface. The collector only tracks physical NICs, so docker bridges and the
-    # veth pairs that come and go with containers never show up here.
     for nic in nics:
         out.append(section(
             "Network IO", "The real wire total in both directions, so it reads higher than the "
@@ -405,7 +382,6 @@ def build():
                      barmetric="tx"),
             sub=nic))
 
-    # One card per filesystem, so a mounted volume starts being tracked on the next restart.
     for mount in fses:
         grows = []
         for w in W4L:
@@ -496,7 +472,6 @@ def services():
             a = avail(n, span)
             cells.append("<td class=nd>collecting</td>" if a is None else
                          "<td class=%s>%s</td>" % ("ok" if a >= 99.5 else "bad", "%.2f%%" % a))
-        # Latency only means something for the http rows, a zero elsewhere would read as instant.
         lat = latency(n) if kind == "http" else None
         rows.append("<tr><td class=lbl>%s</td><td>%s</td><td class=%s>%s</td><td>%s</td><td>%s</td>"
                     "%s<td>%s</td></tr>"

@@ -1,17 +1,11 @@
 #!/bin/bash
-# Deploy the analytics pipeline to your server. Run it from your own machine:  bash deploy.sh
-# (Git Bash on Windows, or any shell with ssh and scp on Linux or macOS.)
-#
-# It deploys the scripts, GoAccess config, systemd units, and GeoIP databases, then rebuilds the
-# dashboard. It does NOT rewrite /etc/caddy/Caddyfile, since that file usually fronts every other
-# site on the box; instead it CHECKS that the required blocks are present and warns if they are not.
-#
-# Config (server address + SSH key) is read from a local .env file that is NOT committed.
-# First time:  cp .env.example .env  and fill in your values.
-# You can also override per run from the environment:  VPS=root@1.2.3.4 SSH_KEY=~/.ssh/key bash deploy.sh
+# Deploys the pipeline to your server. Run from your own machine:  bash deploy.sh
+# Server address and SSH key come from a local uncommitted .env, or from the environment.
+# It never rewrites /etc/caddy/Caddyfile, which usually fronts every other site on the box: it only
+# checks that the required blocks are there and warns if they are not.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-# Load .env, but let anything already set in the environment win (so per run overrides work).
+# Anything already set in the environment wins over .env, so per run overrides work.
 VPS="${VPS:-}"; SSH_KEY="${SSH_KEY:-}"
 if [ -f "$HERE/.env" ]; then
   ENV_VPS="$VPS"; ENV_KEY="$SSH_KEY"
@@ -21,22 +15,30 @@ if [ -f "$HERE/.env" ]; then
 fi
 : "${VPS:?missing VPS, copy .env.example to .env and set it (for example VPS=root@1.2.3.4)}"
 : "${SSH_KEY:?missing SSH_KEY, copy .env.example to .env and set it (for example SSH_KEY=\$HOME/.ssh/key)}"
-# The dashboard hostname and the login name seeded on a fresh install. Both can live in .env.
 STATS_HOST="${STATS_HOST:-stats.example.com}"
 AUTH_USER="${AUTH_USER:-admin}"
-# Where the bundled fonts land. Defaults to the dashboard's own web root, which needs no CORS.
-# Set it in .env to serve them from a shared asset host instead.
 FONT_DIR="${FONT_DIR:-/srv/stats/fonts}"
 SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new $VPS"
 say(){ printf '\n==> %s\n' "$1"; }
 
 say "Deploying scripts to /usr/local/bin"
-scp -i "$SSH_KEY" "$HERE/bin/hails-stats.sh" "$HERE/bin/hails-stats-pre.py" "$HERE/bin/hails-geoip-refresh.sh" "$HERE/bin/hails-admin.py" "$HERE/bin/hails-time.py" "$HERE/bin/hails-panels.py" "$HERE/bin/hails-map.py" "$HERE/bin/hails-rollup.py" "$HERE/bin/hails-bandwidth.py" "$HERE/bin/hails-perf-collect.py" "$HERE/bin/hails-perf.py" "$HERE/bin/hails-served.py" "$VPS:/usr/local/bin/"
-$SSH "chmod +x /usr/local/bin/hails-stats.sh /usr/local/bin/hails-stats-pre.py /usr/local/bin/hails-geoip-refresh.sh /usr/local/bin/hails-admin.py /usr/local/bin/hails-time.py /usr/local/bin/hails-panels.py /usr/local/bin/hails-map.py /usr/local/bin/hails-rollup.py /usr/local/bin/hails-bandwidth.py /usr/local/bin/hails-perf-collect.py /usr/local/bin/hails-perf.py /usr/local/bin/hails-served.py"
+# These scripts are only correct as a set. scp copies sequentially, so a transfer that stops partway
+# leaves a mixed set on the server, which is why this step aborts rather than carrying on.
+# hails_db.py and hails_query.py are modules, imported by hails-ingest.py, so they get no chmod +x.
+scp -i "$SSH_KEY" "$HERE/bin/hails-stats.sh" "$HERE/bin/hails-stats-pre.py" "$HERE/bin/hails-geoip-refresh.sh" "$HERE/bin/hails-admin.py" "$HERE/bin/hails-panels.py" "$HERE/bin/hails-map.py" "$HERE/bin/hails-rollup.py" "$HERE/bin/hails-bandwidth.py" "$HERE/bin/hails-perf-collect.py" "$HERE/bin/hails-perf.py" "$HERE/bin/hails-served.py" "$HERE/bin/hails_db.py" "$HERE/bin/hails_query.py" "$HERE/bin/hails-ingest.py" "$HERE/bin/hails-verify.py" "$HERE/bin/hails-timing.py" "$HERE/bin/hails-diffrender.py" "$HERE/bin/hails-prune.py" "$VPS:/usr/local/bin/" || {
+  echo "FATAL: script transfer failed PARTWAY. scp copies sequentially, so an unknown number of the" >&2
+  echo "       scripts above were already overwritten and the server now holds a MIXED set. Re run" >&2
+  echo "       this deploy until it completes before letting hails-stats.timer fire again." >&2
+  exit 1; }
+# Checked against what actually landed, so a truncated file is caught too.
+$SSH "grep -q -- '--tally' /usr/local/bin/hails-stats-pre.py && grep -q -- '--tally' /usr/local/bin/hails-rollup.py" || {
+  echo "FATAL: the deployed hails-stats-pre.py and hails-rollup.py do not both understand --tally." >&2
+  echo "       Refusing to continue: running hails-stats.sh against this set would freeze" >&2
+  echo "       /var/lib/hails-stats/bandwidth.json at today's values with no error anywhere." >&2
+  exit 1; }
+$SSH "chmod +x /usr/local/bin/hails-stats.sh /usr/local/bin/hails-stats-pre.py /usr/local/bin/hails-geoip-refresh.sh /usr/local/bin/hails-admin.py /usr/local/bin/hails-panels.py /usr/local/bin/hails-map.py /usr/local/bin/hails-rollup.py /usr/local/bin/hails-bandwidth.py /usr/local/bin/hails-perf-collect.py /usr/local/bin/hails-perf.py /usr/local/bin/hails-served.py /usr/local/bin/hails-ingest.py /usr/local/bin/hails-verify.py /usr/local/bin/hails-timing.py /usr/local/bin/hails-diffrender.py /usr/local/bin/hails-prune.py; chmod 644 /usr/local/bin/hails_db.py /usr/local/bin/hails_query.py; rm -f /usr/local/bin/hails-time.py"
 
 say "Ensuring /etc/hails-stats/config.env (seeded once from the example, never overwritten)"
-# Everything machine specific lives here: which disk and NIC to chart, which units and sites to
-# watch, and the map branding. Seeded once so a redeploy never clobbers your edits.
 $SSH "install -d -m 755 /etc/hails-stats"
 scp -i "$SSH_KEY" "$HERE/etc/hails-stats/config.example.env" "$VPS:/etc/hails-stats/config.example.env"
 $SSH 'C=/etc/hails-stats/config.env;
@@ -45,25 +47,21 @@ else echo "  $C already present, left as is"; fi'
 
 say "Deploying GoAccess config + glass skin to /etc/goaccess"
 $SSH "install -d /etc/goaccess"
-scp -i "$SSH_KEY" "$HERE/etc/goaccess/goaccess.conf" "$HERE/etc/goaccess/custom.css" "$HERE/etc/goaccess/settings.html" "$VPS:/etc/goaccess/"
+scp -i "$SSH_KEY" "$HERE/etc/goaccess/goaccess.conf" "$HERE/etc/goaccess/custom.css" "$HERE/etc/goaccess/settings.html" "$HERE/etc/goaccess/table.js" "$VPS:/etc/goaccess/"
 
 say "Deploying the bundled Roboto to $FONT_DIR"
-# Shipped with the project so no page calls Google. One variable woff2 per subset covers every
-# weight. If FONT_DIR is on a different host to the dashboard, that host must send
-# Access-Control-Allow-Origin or the browser silently falls back to the system font.
+# A FONT_DIR on a different host to the dashboard must send Access-Control-Allow-Origin.
 $SSH "install -d -m 755 '$FONT_DIR'"
 scp -i "$SSH_KEY" "$HERE/assets/fonts/"* "$VPS:$FONT_DIR/"
 $SSH "chmod 644 '$FONT_DIR'/*; ls '$FONT_DIR' | tr '\n' ' '; echo"
 
-say "Deploying systemd units + timers (stats + geoip + admin + map + perf + served)"
-scp -i "$SSH_KEY" "$HERE/etc/systemd/hails-stats.service" "$HERE/etc/systemd/hails-stats.timer" "$HERE/etc/systemd/hails-geoip.service" "$HERE/etc/systemd/hails-geoip.timer" "$HERE/etc/systemd/hails-admin.service" "$HERE/etc/systemd/hails-map.service" "$HERE/etc/systemd/hails-map.timer" "$HERE/etc/systemd/hails-perf.service" "$HERE/etc/systemd/hails-served.service" "$VPS:/etc/systemd/system/"
-# hails-perf is resident, not timer driven, and it is restarted rather than reloaded so a changed
-# collector actually takes effect.
-$SSH "systemctl daemon-reload && systemctl enable --now hails-stats.timer hails-geoip.timer hails-map.timer >/dev/null 2>&1; systemctl enable --now hails-admin.service >/dev/null 2>&1; systemctl enable hails-perf.service >/dev/null 2>&1; systemctl restart hails-perf.service >/dev/null 2>&1; echo stats-timer: \$(systemctl is-active hails-stats.timer) geoip-timer: \$(systemctl is-active hails-geoip.timer) map-timer: \$(systemctl is-active hails-map.timer) admin: \$(systemctl is-active hails-admin.service) perf: \$(systemctl is-active hails-perf.service)"
+say "Deploying systemd units + timers (stats + ingest + geoip + admin + map + perf + served + verify + prune)"
+scp -i "$SSH_KEY" "$HERE/etc/systemd/hails-stats.service" "$HERE/etc/systemd/hails-stats.timer" "$HERE/etc/systemd/hails-ingest.service" "$HERE/etc/systemd/hails-ingest.timer" "$HERE/etc/systemd/hails-geoip.service" "$HERE/etc/systemd/hails-geoip.timer" "$HERE/etc/systemd/hails-admin.service" "$HERE/etc/systemd/hails-map.service" "$HERE/etc/systemd/hails-map.timer" "$HERE/etc/systemd/hails-perf.service" "$HERE/etc/systemd/hails-served.service" "$HERE/etc/systemd/hails-verify.service" "$HERE/etc/systemd/hails-verify.timer" "$HERE/etc/systemd/hails-prune.service" "$HERE/etc/systemd/hails-prune.timer" "$VPS:/etc/systemd/system/"
+# hails-perf is resident rather than timer driven, so it is restarted to pick up a changed collector.
+$SSH "systemctl daemon-reload && systemctl enable --now hails-stats.timer hails-ingest.timer hails-geoip.timer hails-map.timer hails-verify.timer hails-prune.timer >/dev/null 2>&1; systemctl enable --now hails-admin.service >/dev/null 2>&1; systemctl enable hails-perf.service >/dev/null 2>&1; systemctl restart hails-perf.service >/dev/null 2>&1; echo stats-timer: \$(systemctl is-active hails-stats.timer) ingest-timer: \$(systemctl is-active hails-ingest.timer) geoip-timer: \$(systemctl is-active hails-geoip.timer) map-timer: \$(systemctl is-active hails-map.timer) verify-timer: \$(systemctl is-active hails-verify.timer) admin: \$(systemctl is-active hails-admin.service) perf: \$(systemctl is-active hails-perf.service)"
 
 say "Ensuring the isolated stats auth import + admins file (seeded once, never overwritten)"
-# The login lives in its own file rather than inline in the Caddyfile, so the Settings page can add
-# and remove users without ever touching the config that fronts your other sites.
+# The login lives in its own file so the Settings page can edit users without touching the Caddyfile.
 $SSH "U='$AUTH_USER'; "'A=/etc/caddy/stats_auth; ADM=/etc/caddy/stats_admins;
 if [ ! -s "$A" ]; then
   H=$(cat /root/.stats_bcrypt 2>/dev/null);
@@ -73,8 +71,8 @@ else echo "  $A already present, left as is"; fi
 if [ ! -s "$ADM" ]; then echo "$U" > "$ADM"; chmod 640 "$ADM"; chown root:caddy "$ADM"; echo "  seeded $ADM with admin: $U"; else echo "  $ADM already present, left as is"; fi'
 
 say "Ensuring runtime dirs (owned by caddy)"
-# /var/lib/hails-stats holds the durable bandwidth history. Root owned: only the root run regen
-# script writes it, and it must NOT sit under /srv/stats, which is wiped on every rebuild.
+# /var/lib/hails-stats holds the durable history, so it must stay outside /srv/stats, which is wiped
+# on every rebuild.
 $SSH "install -d -o caddy -g caddy -m 755 /srv/stats /var/log/caddy; install -d -m 755 /var/lib/hails-stats; chown -R caddy:caddy /var/log/caddy"
 
 say "Ensuring python3-maxminddb + python3-user-agents (Geo/ASN lookups and OS/Browser parsing)"

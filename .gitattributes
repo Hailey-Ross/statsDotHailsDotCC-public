@@ -1,5 +1,5 @@
-# These files run on the Linux VPS — keep LF endings so shebangs and configs
-# never get corrupted by Windows CRLF conversion.
+# These files run on a Linux server, so keep LF endings and never let Windows CRLF conversion
+# corrupt a shebang or a config.
 * text=auto eol=lf
 *.sh    text eol=lf
 *.py    text eol=lf

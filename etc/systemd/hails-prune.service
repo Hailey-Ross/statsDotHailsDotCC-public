@@ -1,0 +1,7 @@
+[Unit]
+Description=Prune aged events and unreferenced dimension rows from the hails events warehouse
+
+[Service]
+EnvironmentFile=-/etc/hails-stats/config.env
+Type=oneshot
+ExecStart=/usr/local/bin/hails-prune.py

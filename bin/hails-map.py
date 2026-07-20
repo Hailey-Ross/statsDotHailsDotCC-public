@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
-# Network map and per domain sitemaps, generated from the live Caddyfile.
-# Reads the Caddyfile, classifies every site block as static, redirect or proxy, and writes:
-#   1. a self contained topology map to /srv/stats/map.html, behind the stats basic auth,
-#   2. a public sanitized map into the public host's root, and
-#   3. a sitemap.xml into each static file_server root.
-# Run as root by hails-map.timer.
-#
-# Branding and the public page read from the environment, normally /etc/hails-stats/config.env:
-# HAILS_MAP_ORG, HAILS_MAP_CANON, HAILS_MAP_PUBLIC_HOST and HAILS_MAP_PORTSVC.
+# Network map and per domain sitemaps, generated from the live Caddyfile. Run as root by
+# hails-map.timer. Writes the private map to /srv/stats/map.html, a sanitised public map into the
+# public host's root, and a sitemap.xml into each static file_server root. Branding comes from the
+# environment.
 #
 # Usage:
 #   hails-map.py                 production: /srv/stats/map.html + sitemap.xml into each /srv root
-#   hails-map.py --dry <outdir>  test: write map.html and <host>.sitemap.xml into <outdir>, touch nothing else
+#   hails-map.py --dry <outdir>  test: write map.html and <host>.sitemap.xml into <outdir> only
 #   hails-map.py --caddyfile <p> override the Caddyfile path (default /etc/caddy/Caddyfile)
 import sys, os, re, html, time, glob, json
 
-# Roboto is bundled rather than fetched from Google, so no page makes a third party call.
-# One variable file per subset covers every weight from 100 to 900.
 FONT_BASE = os.environ.get("HAILS_FONT_BASE", "/fonts").rstrip("/")
 FONT_CSS = (
     "@font-face{font-family:'Roboto';font-style:normal;font-weight:100 900;font-display:swap;src:url(%s/roboto-latin-ext.woff2) format('woff2');unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}"
@@ -41,9 +34,8 @@ while i < len(argv):
     else:
         i += 1
 
-# Friendly labels for proxied localhost ports, as comma separated port|label pairs:
-#   HAILS_MAP_PORTSVC=3000|Link shortener,8002|Radio
-# Unlisted ports are drawn with their port number.
+# Labels for proxied localhost ports, comma separated port|label pairs. Unlisted ports are drawn
+# with their port number.
 PORTSVC = {}
 for _pair in os.environ.get("HAILS_MAP_PORTSVC", "").split(","):
     _p = [x.strip() for x in _pair.split("|")]
@@ -51,7 +43,7 @@ for _pair in os.environ.get("HAILS_MAP_PORTSVC", "").split(","):
         PORTSVC[_p[0]] = _p[1]
 PORTSVC.setdefault("8770", "stats admin")
 
-# Branding for both maps. PUBLIC_HOST also decides whether a public page is written at all.
+# PUBLIC_HOST also decides whether a public page is written at all.
 ORG = os.environ.get("HAILS_MAP_ORG", "example")
 PUBLIC_HOST = os.environ.get("HAILS_MAP_PUBLIC_HOST", "")
 CANON = os.environ.get("HAILS_MAP_CANON", "https://%s/network.html" % (PUBLIC_HOST or "example.com"))
@@ -60,7 +52,6 @@ ORGID = ORGURL + "#org"
 
 
 def registrable(host):
-    # strip any scheme and trailing port, then take the last two labels
     h = host.split("://", 1)[-1]
     h = h.split(":", 1)[0]
     parts = h.split(".")
@@ -112,7 +103,6 @@ def strip_nested(text):
 
 
 def classify(header, body):
-    # returns a list of host dicts for one site block, or None for a global block or snippet
     if not header or header.startswith("("):
         return None
     scheme = ""
@@ -182,14 +172,12 @@ def load_hosts():
         c = classify(header, body)
         if c:
             hosts.extend(c)
-    # stable order: by registrable domain, then host
     hosts.sort(key=lambda h: (h["regdom"], h["host"], h["scheme"]))
     for idx, h in enumerate(hosts):
         h["id"] = idx           # unique per block, so two listeners on the same host do not collide
     return hosts
 
 
-# ---- SVG topology map ---------------------------------------------------------------------------
 HOST_X, HOST_W = 300, 250
 SVC_X, SVC_W = 720, 320
 NH = 40
@@ -219,7 +207,6 @@ def node(x, y, w, title, sub, dot=None):
 
 
 def build_svg(hosts):
-    # host y positions, grouped by registrable domain with a header row per group
     groups = {}
     for h in hosts:
         groups.setdefault(h["regdom"], []).append(h)
@@ -240,7 +227,6 @@ def build_svg(hosts):
         if h["host"] not in id_of_name or h["scheme"] != "http":
             id_of_name[h["host"]] = h["id"]
 
-    # service / destination nodes (right column): one per static root, one per proxy service
     svc_keys = []          # ordered unique keys
     svc_label = {}
     for h in hosts:
@@ -341,7 +327,6 @@ def redir_code(h):
     return {"permanent": "301", "temporary": "302"}.get(code, code)
 
 
-# ---- inventory table ----------------------------------------------------------------------------
 def backend_cell(h):
     if h["role"] == "redirect":
         return redir_code(h) + " : " + esc(shorten(h["redir"][0]))
@@ -383,7 +368,6 @@ def build_table(hosts):
             "<tbody>" + rows + "</tbody></table></div></div>")
 
 
-# ---- page ---------------------------------------------------------------------------------------
 FAVICON = ('<link rel="icon" type="image/x-icon" href="data:image/x-icon;base64,AAABAAEAEBAQAAEABAAo'
            'AQAAFgAAACgAAAAQAAAAIAAAAAEABAAAAAAAgAAAAAAAAAAAAAAAEAAAAAAAAADGxsYAWFhYABwcHABfAP8A/9df'
            'AADXrwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIiIiIiIiIiIjMlUkQgAiIiIiIiIi'
@@ -446,11 +430,8 @@ def build_page(hosts):
                 .replace("__STAMP__", stamp))
 
 
-# Public sanitized map, for search engines.
-
-
 def public_hosts(hosts):
-    # only hosts a visitor could reach: auth walled hosts are dropped and each hostname appears
+    # Only hosts a visitor could reach: auth walled hosts are dropped, and each hostname appears
     # once, preferring the HTTPS block over a plain HTTP listener
     seen = {}
     for h in hosts:
@@ -467,7 +448,6 @@ def public_role(h):
     if h["role"] == "static":
         return ("website", "website")
     if h["role"] == "proxy":
-        # lowercase the HAILS_MAP_PORTSVC label so it reads as a role, unlabelled ports stay "service"
         name, _ = svc_of(h["upstream"])
         return ("service", name.lower() if name and not name[0].isdigit() else "service")
     return ("site", "site")
@@ -603,7 +583,6 @@ def public_root(hosts):
     return None
 
 
-# ---- sitemaps -----------------------------------------------------------------------------------
 def build_sitemaps(hosts):
     # group static hosts by root dir. STATS_DIR is skipped so the private dashboard is never indexed.
     by_root = {}
@@ -663,16 +642,13 @@ def write_file(path, content):
         pass
 
 
-# ---- main ---------------------------------------------------------------------------------------
 def main():
     hosts = load_hosts()
     if DRY and not os.path.isdir(DRYOUT):
         os.makedirs(DRYOUT)
-    # private full map, behind the stats basic auth
     map_out = os.path.join(DRYOUT, "map.html") if DRY else os.path.join(STATS_DIR, "map.html")
     write_file(map_out, build_page(hosts))
-    # public sanitized map, written into the public host's static root.
-    # must run before build_sitemaps so the sitemap walk picks it up.
+    # Written before the sitemaps, so the sitemap walk picks it up.
     proot = public_root(hosts)
     pub_out = None
     if proot:

@@ -1,0 +1,43 @@
+# Refuse the paths vulnerability scanners walk, before they reach any backend.
+#
+# Import it into each site block, after `import access_log` so the refusals are still logged:
+#
+#   example.com {
+#       import access_log
+#       import block_probes
+#       ...
+#   }
+#
+# Every token needs both a root and a nested form. A Caddy path matcher anchors at the start, so
+# `/.env*` on its own leaves `/api/.env` answering from your backend.
+#
+# Two things to leave alone: no bare `*.php*` glob, it will catch a real endpoint of yours sooner or
+# later, and no `admin` token, which breaks admin UIs. Keep the extensions literal.
+(block_probes) {
+	@probe_path path \
+		/.env* */.env* *.env \
+		/.git/* */.git/* /.svn/* */.svn/* /.aws/* */.aws/* /.ssh/* */.ssh/* \
+		/.DS_Store* */.DS_Store* /_profiler/* */_profiler/* \
+		/wp-admin/* */wp-admin/* /wp-includes/* */wp-includes/* \
+		/wp-config.php* */wp-config.php* /wp-login.php* */wp-login.php* \
+		/xmlrpc.php* */xmlrpc.php* /phpmyadmin* */phpmyadmin* \
+		/phpinfo.php* */phpinfo.php* /php-info.php* */php-info.php* \
+		/phpversion.php* */phpversion.php* /php.php* */php.php* \
+		/i.php* */i.php* /info.php* */info.php* /test.php* */test.php* \
+		/shell.php* */shell.php* /eval-stdin.php* */eval-stdin.php* \
+		/adminer.php* */adminer.php*
+	# WordPress user enumeration, which lives in the query string where a path matcher cannot see it.
+	# Matches on the key alone, so a bare / is never affected.
+	@probe_query query rest_route=*
+	respond @probe_path 403
+	respond @probe_query 403
+}
+
+# Two placements will not work with a plain `respond`, because Caddy sorts directives rather than
+# reading them in order:
+#
+#   Redirect blocks. `redir` sorts ahead of `respond`, so the redirect wins. Usually fine, since the
+#   target site blocks the probe anyway.
+#
+#   Blocks ending in a catch all `handle { }`. That matches everything and terminates the chain, so
+#   the respond never runs. Use `handle @probe_path { respond 403 }` placed before the others.

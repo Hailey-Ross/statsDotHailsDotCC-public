@@ -1,0 +1,10 @@
+[Unit]
+Description=Ingest the Caddy access log into the hails events warehouse every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

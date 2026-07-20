@@ -1,43 +1,26 @@
 #!/usr/bin/env python3
-# The VPS performance collector: a resident sampler for the Performance page.
+# Resident sampler behind the Performance page, run by hails-perf.service with no arguments.
+# Samples /proc plus service and HTTP probes into fixed size binary rings under /var/lib/hails-stats,
+# which hails-perf.py renders. Every /proc counter is cumulative since boot, so this is the only
+# source of history. Configuration comes from the environment.
 #
-#   python3 hails-perf-collect.py            (run by hails-perf.service, no arguments)
-#
-# Samples /proc plus service and HTTP probes, and writes fixed size binary rings, perf_meta.json and
-# perf_svc.json under /var/lib/hails-stats. hails-perf.py renders what it collects. Nothing here has
-# a history to read from: every /proc counter is cumulative since boot, so this daemon is the only
-# source of the past.
-#
-# Stdlib only, single threaded, rings allocated once and never grown.
-#
-# Tiers, and the window each one serves:
-#   raw 10s, 3 hours    : 1 min, 5 min, 15 min, 30 min, hour
-#   5 min, 7 days       : day, week
-#   1 hour, 1 year      : month
-#   1 day, 5 years      : year
-# Rollups cascade: raw closes into 5 min, 5 min into hourly, hourly into daily.
-#
-# Hardware is discovered at startup, so a resized box picks up new cores, disks, volumes and NICs on
-# the next restart. Each entity owns its own ring files, which is what makes that safe: adding a core
-# creates one new set of files and leaves every existing ring untouched. Sharing one wide record
-# would mean the record width changed, and a width change wipes every tier.
-#
-# Configuration comes from the environment, normally /etc/hails-stats/config.env.
-#
-# No dash punctuation in text: commas and colons only.
+# Each entity owns its own ring files. That is what makes hardware discovery at startup safe: a new
+# core adds one set of files and leaves every existing ring untouched, whereas one wide shared record
+# would change width, and a width change wipes every tier.
 import os, sys, time, json, struct, subprocess, zlib, urllib.request, urllib.error
 
 DIR = os.environ.get("HAILS_PERF_DIR", "/var/lib/hails-stats")
-INTERVAL = float(os.environ.get("HAILS_PERF_INTERVAL", "10"))     # sample cadence, seconds
-HTTP_EVERY = float(os.environ.get("HAILS_PERF_HTTP", "300"))      # HTTP probe cadence
-LOCAL_EVERY = float(os.environ.get("HAILS_PERF_LOCAL", "300"))    # systemd and docker cadence
-SVC_FLUSH = 300.0                                                 # service json flush cadence
+# All cadences in seconds.
+INTERVAL = float(os.environ.get("HAILS_PERF_INTERVAL", "10"))
+HTTP_EVERY = float(os.environ.get("HAILS_PERF_HTTP", "300"))
+LOCAL_EVERY = float(os.environ.get("HAILS_PERF_LOCAL", "300"))
+SVC_FLUSH = 300.0
 SCHEMA = 2
 
 META = os.path.join(DIR, "perf_meta.json")
 SVCF = os.path.join(DIR, "perf_svc.json")
 
-# Metrics held per entity in each group. Widths here are fixed, only the number of entities varies.
+# Metrics per entity in each group. The width is fixed, only the number of entities varies.
 GROUPS = {
     "sys":  ["load1", "load5", "load15", "cpu", "steal", "iowait",
              "mem_pct", "mem_used", "mem_total", "swap_used", "swap_total"],
@@ -47,8 +30,9 @@ GROUPS = {
     "net":  ["rx", "tx"],
 }
 
-# (tier key, slot count, bucket seconds). 2100 five minute slots not 2016: a week is exactly 2016,
-# so the exact figure would leave the week window resting on the single oldest record.
+# (tier key, slot count, bucket seconds). Rollups cascade: raw closes into 5m, 5m into 1h, 1h into
+# 1d. Slot counts run slightly over the window each tier serves, so the oldest record is never the
+# one the window rests on.
 TIERS = [("raw", 1080, 0), ("5m", 2100, 300), ("1h", 8760, 3600), ("1d", 1825, 86400)]
 
 
@@ -66,7 +50,7 @@ def read(path):
         return fh.read()
 
 
-# Hardware discovery. Runs once at startup, so new hardware appears after a restart.
+# Hardware discovery runs once at startup, so new hardware appears only after a restart.
 def list_cores():
     out = []
     try:
@@ -145,7 +129,6 @@ def list_nics():
     return out or ["lo"]
 
 
-# Ring files
 class Ring(object):
     """A fixed size ring of packed records. Allocated once, written one slot at a time."""
 
@@ -154,9 +137,8 @@ class Ring(object):
         self.head = 0
         self.count = 0
         want = recsz * slots
-        # Decide create versus open on the size ALONE. Anything else that can go wrong, a short read
-        # or a bad unpack, must not reach the branch that zero fills the file, or a transient IO
-        # error would cost the five year ring.
+        # Create versus open is decided on the file size alone: no other failure may reach the branch
+        # that zero fills, or a transient IO error would cost the five year ring.
         try:
             usable = os.path.getsize(path) == want
         except Exception:
@@ -167,16 +149,13 @@ class Ring(object):
             try:
                 self.scan()
             except Exception as e:
-                # Unreadable content, but the file is the right size, so keep it and append from the
-                # start rather than destroying records that may still be perfectly good.
                 log("could not scan %s (%s), appending from slot 0" % (os.path.basename(path), e))
                 self.head = 0
                 self.count = 0
             return
 
-        # Wrong size means the metric list for this group changed, so the old records cannot be read
-        # back. Move them aside and say so rather than truncating in place. Hardware changes do NOT
-        # come through here: each entity owns a file of its own fixed width.
+        # A wrong size means the metric list for this group changed and the old records can no longer
+        # be read back.
         if os.path.exists(path):
             try:
                 os.replace(path, path + ".old")
@@ -306,9 +285,8 @@ class Series(object):
 
     def add(self, now, v):
         self.rings["raw"].append(struct.pack(self.raw_fmt, int(now), *v))
-        # Each tier is keyed on the timestamp of the item being folded in, never on now: 5 min
-        # boundaries align with hour boundaries, so at the top of an hour the closing 5 min bucket
-        # still belongs to the hour that just ended.
+        # Each tier is keyed on the timestamp of the item being folded in, never on now: at the top of
+        # an hour the closing 5 min bucket still belongs to the hour that just ended.
         carry = None
         for tier, _, secs in TIERS:
             if not secs:
@@ -336,7 +314,6 @@ class Series(object):
             carry = closed
 
 
-# /proc readers
 def proc_loadavg():
     p = read("/proc/loadavg").split()
     return float(p[0]), float(p[1]), float(p[2])
@@ -433,8 +410,8 @@ class Sampler(object):
         if dt <= 0:
             return now, None
 
-        # A counter going backwards means the machine rebooted between samples, so the whole cycle is
-        # dropped rather than zero filled: a zero would drag every mean containing it down.
+        # A counter going backwards means a reboot between samples, so the whole cycle is dropped
+        # rather than zero filled, which would drag every mean containing it down.
         regressed = [False]
 
         def d(c, p):
@@ -496,7 +473,6 @@ class Sampler(object):
         return now, out
 
 
-# Service probes
 def parse_units(raw):
     return [u.strip() if u.strip().endswith(".service") else u.strip() + ".service"
             for u in raw.split(",") if u.strip()]
@@ -524,7 +500,8 @@ def parse_targets(raw):
 SYSTEMD_UNITS = parse_units(os.environ.get("HAILS_PERF_UNITS", "caddy.service,docker.service"))
 HTTP_TARGETS = parse_targets(os.environ.get("HAILS_PERF_TARGETS", ""))
 
-UA = "hails-perf-probe"     # must stay in sync with PROBE_UA in hails-stats-pre.py, which drops these
+# Must stay in sync with PROBE_UA in hails-stats-pre.py, which drops these requests from the stats.
+UA = "hails-perf-probe"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -647,8 +624,8 @@ class Services(object):
     def prune(self, now):
         """Forget services that stopped being probed, so a deleted container does not keep rendering
         a green row on the strength of a check that last happened months ago."""
-        # Must allow for the SLOWER of the two probe cadences, or raising HAILS_PERF_HTTP past the
-        # cutoff would prune every http row each pass and take its availability history with it.
+        # The cutoff must allow for the slower of the two probe cadences, or raising HAILS_PERF_HTTP
+        # past it would prune every http row each pass.
         cutoff = now - max(3 * LOCAL_EVERY, 3 * HTTP_EVERY, 900)
         for name in [n for n, c in self.doc["cur"].items() if c.get("checked", 0) < cutoff]:
             del self.doc["cur"][name]
@@ -666,7 +643,6 @@ class Services(object):
             log("service flush failed: %s" % e)
 
 
-# Main loop
 def load_meta():
     try:
         with open(META, "r", encoding="utf-8") as fh:
@@ -689,13 +665,11 @@ def save_meta(meta, series):
                 meta["open"]["%s_%s" % (s.key, tier)] = b.to_dict()
     meta["updated"] = int(time.time())
     meta["interval"] = INTERVAL
-    # The renderer builds its columns from this, so it follows a hardware change automatically.
     meta["groups"] = {g: {"metrics": GROUPS[g],
                           "entities": sorted({s.entity for s in series.values()
                                               if s.group == g and s.entity is not None})}
                       for g in GROUPS}
-    # The resolved ring name per entity, so the renderer never has to recompute it and stays right
-    # even when a name clash forced a suffix.
+    # The resolved ring name per entity, so the renderer stays right when a clash forced a suffix.
     meta["keys"] = {"%s|%s" % (s.group, "" if s.entity is None else s.entity): s.key
                     for s in series.values()}
     tmp = META + ".tmp"
@@ -716,10 +690,9 @@ def build_series(meta):
     wanted += [("fs", m) for m, _d in fs]
     wanted += [("net", n) for n in nics]
 
-    # Two entities can sanitise to the same filename, for example / and /root both becoming "root",
-    # or /mnt/data and /mnt-data both becoming "mnt_data". Sharing a ring file would interleave two
-    # histories and corrupt both, so a clash gets a suffix from a crc of the full name. crc32 and not
-    # hash(), because hash() is salted per process and the suffix has to be the same every restart.
+    # Two entities can sanitise to the same filename, and sharing a ring file would interleave their
+    # histories, so a clash takes a crc32 suffix. Not hash(), which is salted per process and so
+    # would not survive a restart.
     series = {}
     used = set()
     for group, entity in wanted:
@@ -730,7 +703,6 @@ def build_series(meta):
         used.add(key)
         s = Series(group, entity, GROUPS[group], key)
         for tier, _slots, secs in TIERS:
-            # head and count come from Ring.scan, not from meta, so a restart never rewinds.
             if secs:
                 d = meta.get("open", {}).get("%s_%s" % (s.key, tier))
                 if isinstance(d, dict):
@@ -770,7 +742,6 @@ def cycle(sampler, series, svcs, meta, last):
             active = st.get("ActiveState", "") == "active"
             since = 0
             try:
-                # Monotonic, so a clock step does not move the reported start time.
                 mono = int(st.get("ActiveEnterTimestampMonotonic", "0"))
                 if mono > 0:
                     since = int(boot + mono / 1000000.0)
@@ -799,8 +770,7 @@ def cycle(sampler, series, svcs, meta, last):
         svcs.flush()
     if now - last["meta"] >= 60:
         last["meta"] = now
-        # Persists the buckets still filling: a daily bucket closes only when the first hour of the
-        # next day closes, so a restart in that window would otherwise drop a whole day.
+        # Persists the buckets still filling, or a restart mid day would drop the whole day.
         save_meta(meta, series)
 
 
@@ -822,8 +792,6 @@ def main():
         try:
             cycle(sampler, series, svcs, meta, last)
         except Exception as e:
-            # Never die on one bad cycle: with Restart=always a persistent fault would respawn the
-            # process every few seconds and reprobe every target each time.
             log("cycle failed: %s" % e)
         tick += INTERVAL
         gap = tick - time.monotonic()

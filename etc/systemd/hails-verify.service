@@ -1,0 +1,8 @@
+[Unit]
+Description=Verify the hails events warehouse against a fresh pass over the raw logs
+
+[Service]
+EnvironmentFile=-/etc/hails-stats/config.env
+Type=oneshot
+ExecStart=/usr/local/bin/hails-verify.py
+# A nonzero exit means the warehouse disagrees with the log. Left as a failed unit on purpose.

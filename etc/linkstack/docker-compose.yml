@@ -9,9 +9,8 @@
 #     curl -f http://localhost -A "HealthCheck"
 #
 # LinkStack routes by virtual host, so a request arriving as Host: localhost matches no configured
-# site and comes back 404. The check fails the moment the container starts and never recovers. One
-# container was observed with a failing streak of 2252, exactly its uptime, while the site itself
-# had been serving 200 the whole time.
+# site and comes back 404. The check fails the moment the container starts and never recovers, while
+# the site itself serves 200 the whole time.
 #
 # That matters here because your service table then sits permanently at "running, unhealthy". A red
 # row that is always red is worse than no row at all: it teaches you to ignore the one place a real
