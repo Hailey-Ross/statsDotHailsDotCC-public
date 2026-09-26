@@ -100,6 +100,9 @@ all traffic. The two will not agree, on purpose.
 
 **Time Served is your response time**, not how long anyone read the page. A log cannot tell you that.
 
+**p95 is sampled.** The p95 tile, and p50 and p95 on Slowest Endpoints, are estimated from a random
+sample of each window's requests. Avg and Max are exact.
+
 **The long windows start empty.** The warehouse only knows what it has seen since you installed it,
 so a Weekly view needs a week and a Monthly needs a month. Until then those pages say they are still
 collecting rather than showing you a confident number built from two days.

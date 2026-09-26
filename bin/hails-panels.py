@@ -54,7 +54,7 @@ while _i < len(_args):
 TITLE = _pos[0] if _pos else "All domains (aggregate)"
 OUTDIR = _pos[1] if len(_pos) > 1 else "."
 
-_seed = os.environ.get("HAILS_SEED")
+_seed = os.environ.get("HAILS_SEED") or os.environ.get("HAILS_NOW")
 if _seed:
     try:
         random.seed(int(_seed))
@@ -435,14 +435,16 @@ def db_records():
 
     con = hq.connect()
 
-    # Global rather than per scope: a quiet host can legitimately see nothing for hours.
+    # Global rather than per scope: a quiet host can legitimately see nothing for hours. Measured
+    # against the wall clock, because the regen pins NOW to the newest event.
+    wall = int(time.time())
     newest = con.execute("SELECT MAX(ts) FROM event").fetchone()[0]
-    if newest is None or (NOW - newest) > DB_STALE_S:
+    if newest is None or (wall - newest) > DB_STALE_S:
         con.close()
         sys.stderr.write(
             "hails-panels: warehouse is stale, newest event is %s (%s), refusing to render\n"
             % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(newest)) if newest else "none",
-               ("%.1f hours old" % ((NOW - newest) / 3600.0)) if newest else "table empty"))
+               ("%.1f hours old" % ((wall - newest) / 3600.0)) if newest else "table empty"))
         sys.exit(4)
 
     scope = DB_SCOPE
@@ -484,11 +486,11 @@ def db_records():
         "LEFT JOIN dim_str brv ON brv.id=ua.browser_id "
         # (src_id, src_off) is the byte position, which IS log order. Ordering by ts is not the
         # same thing: the line is written when the response completes, ts is when it started.
-        "WHERE e.ts>=? AND e.host_id IN %s ORDER BY e.src_id, e.src_off" % idlist)
+        "WHERE e.ts>=? AND e.ts<=? AND e.host_id IN %s ORDER BY e.src_id, e.src_off" % idlist)
 
     try:
         for (ts, st, size, dur, host, uri, ip, ua, ref, meth, ctype, tls, loc,
-             cty, asn, os_v, br_v) in con.execute(q, (lo,)):
+             cty, asn, os_v, br_v) in con.execute(q, (lo, NOW)):
             if ip:
                 if cty:
                     geo_cache[ip] = cty
@@ -707,11 +709,14 @@ for o in (db_records() if FROM_DB else stdin_records()):
         if uri and du > 0:
             sl = S["slow"].get(uri)
             if sl is None and len(S["slow"]) < ACC_CAP:
-                sl = S["slow"][uri] = {"reqs": 0, "err": 0, "samp": [], "samp_n": 0}
+                sl = S["slow"][uri] = {"reqs": 0, "err": 0, "samp": [], "samp_n": 0, "dsum": 0, "dmax": 0}
             if sl is not None:
                 sl["reqs"] += 1
                 if not ok:
                     sl["err"] += 1
+                sl["dsum"] += du
+                if du > sl["dmax"]:
+                    sl["dmax"] = du
                 ring(sl, "samp", SAMPCAP, du)
         if ip:
             S["vis"].add(ip)
@@ -1275,17 +1280,17 @@ def slow_view(slow):
         if sl["reqs"] < 5:
             continue
         s = sorted(sl["samp"])
-        rows_data.append((u, sl["reqs"], sl["err"], s))
+        rows_data.append((u, sl["reqs"], sl["err"], s, sl["dsum"], sl["dmax"]))
     rows_data.sort(key=lambda r: percentile(r[3], 0.95), reverse=True)
     if not rows_data:
         return "<div class=card><div class=empty>Not enough timing data in this window.</div></div>"
     rows = ""
-    for u, reqs, err, s in rows_data[:FLATCAP]:
-        avg = int(sum(s) / len(s)) if s else 0
+    for u, reqs, err, s, dsum, dmax in rows_data[:FLATCAP]:
+        avg = int(dsum / reqs) if reqs else 0
         rows += ("<tr><td class=lbl><span class=v>%s</span></td><td>%s</td><td>%s</td><td>%s</td>"
                  "<td>%s</td><td>%s</td><td>%.1f%%</td></tr>") % (
             dlink(u), reqs, ms(avg), ms(percentile(s, 0.5)), ms(percentile(s, 0.95)),
-            ms(max(s)), 100.0 * err / reqs if reqs else 0.0)
+            ms(dmax), 100.0 * err / reqs if reqs else 0.0)
     return ("<div class=\"card sortable\"><div class=tw><table><thead><tr><th>URL</th><th>Requests</th>"
             "<th>Avg ms</th><th>p50 ms</th><th>p95 ms</th><th>Max ms</th><th>Error %</th></tr></thead>"
             "<tbody>" + rows + "</tbody></table></div></div>")
@@ -1321,7 +1326,7 @@ def overview_view(w):
         tile("Total Requests", "{:,}".format(tot), fmt_delta(tot, P["total"], w=w)),
         tile("Error Rate", "%.1f%%" % errrate, fmt_delta(errrate, perrrate, invert=True, w=w)),
         tile("Avg Response", "%d ms" % avg, ""),
-        tile("p95 Response", "%d ms" % p95, ""),
+        tile("p95 Response (sampled)", "%d ms" % p95, ""),
         tile("Bandwidth", hb(S["bytes"]), fmt_delta(S["bytes"], P["bytes"], w=w)),
     ])
     tiles = "<div class=tiles>%s</div>" % tiles
@@ -1607,7 +1612,9 @@ write("exit.html", page(TITLE + " : Exit Pages",
 write("slow.html", page(TITLE + " : Slowest Endpoints",
       {w: slow_view(CUR[w]["slow"]) for w in WINS},
       "Server response time in milliseconds, not visitor dwell time. p95 means 95 percent of requests "
-      "were faster than this. Only URLs with at least 5 requests are shown. " + FOOT_BASE))
+      "were faster than this. Avg and Max are exact; p50 and p95 are estimated from a random sample "
+      "of up to %d requests per URL, as is the p95 tile on the Overview. Only URLs with at least 5 "
+      "requests are shown. " % SAMPCAP + FOOT_BASE))
 
 detail_json = build_detail_json()
 write("detail.json", json.dumps({"pages": detail_json}))

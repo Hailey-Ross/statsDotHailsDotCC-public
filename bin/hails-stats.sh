@@ -110,7 +110,7 @@ gen_scope(){ local dir="$1" title="$2" lf="$3" scope="$4"; mkdir -p "$dir"
   python3 "$PANELGEN" "$title" "$dir" --from-db --scope "$scope" 2>"$perr" \
     || { echo "hails-stats: warehouse render failed for scope '$scope' ($(tr '\n' ' ' < "$perr" | tail -c 300)), falling back to the log" >&2
          psize="$lfsz"
-         python3 "$PANELGEN" "$title" "$dir" < "$lf"; }
+         env -u HAILS_NOW python3 "$PANELGEN" "$title" "$dir" < "$lf"; }   # the log has no watermark
   rm -f "$perr"
   tend panels "$scope" "$psize"
   tstart
@@ -186,6 +186,11 @@ export HAILS_SERVED_ROOT
 tstart
 python3 "$SERVEDGEN" >/dev/null 2>&1 || true
 tend served
+
+# One instant for every scope: the newest ingested event is both the clock and the upper bound.
+HAILS_NOW=$(python3 -c 'import sys; sys.path.insert(0, "/usr/local/bin"); import hails_db as db
+print(db.connect(readonly=True).execute("SELECT MAX(ts) FROM event").fetchone()[0] or "")' 2>/dev/null)
+if [ -n "$HAILS_NOW" ]; then export HAILS_NOW; else unset HAILS_NOW; fi
 
 gen_scope "$STAGE/all" "All domains (aggregate)" "$AGGLOG" "all"
 for h in $hosts; do safe=${safeof["$h"]}; gen_scope "$STAGE/d/$safe" "$h" "$SPLITDIR/$safe.log" "$h"; done
