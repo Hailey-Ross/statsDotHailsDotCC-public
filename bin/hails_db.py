@@ -13,10 +13,9 @@ import datetime
 SCHEMA_VERSION = 3
 DB_PATH = os.environ.get("HAILS_DB", "/var/lib/hails-stats/events.db")
 
-# Content fingerprint of a log file's opening bytes, used to recognise the same logical file after
-# its inode changes.
 FP_BYTES = 4096
-FP_MIN = 512
+# Must equal FP_BYTES: a shorter head fingerprints the live log and its rotated copy differently.
+FP_MIN = FP_BYTES
 
 
 def fingerprint(head):
@@ -150,6 +149,9 @@ def day_bounds(day):
 def connect(path=None, readonly=False):
     path = path or DB_PATH
     fresh = not os.path.exists(path)
+    if readonly and fresh:
+        # sqlite would create it, and a database first created here never gets auto_vacuum set.
+        raise FileNotFoundError("no warehouse at %s" % path)
     if not readonly:
         d = os.path.dirname(path)
         if d:

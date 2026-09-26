@@ -84,29 +84,30 @@ def prune_dims(con):
     """Drop dimension rows referenced by neither event nor roll_day_dim. Returns {table: removed}.
 
     A value still cited by any retained roll_day_dim row must survive, or that panel renders a bare
-    id. NOT EXISTS rather than NOT IN, because ua_id and ref_id are nullable.
+    id. event has no index on these columns, hence the temp table.
     """
     out = {}
     for table, col, dim in DIM_TABLES:
-        keep_roll = ""
-        params = ()
+        con.execute("DROP TABLE IF EXISTS temp.referenced")
+        con.execute("CREATE TEMP TABLE referenced(id INTEGER PRIMARY KEY)")
+        con.execute("INSERT OR IGNORE INTO temp.referenced(id) SELECT DISTINCT %s FROM event "
+                    "WHERE %s IS NOT NULL" % (col, col))
         if dim is not None:
-            keep_roll = (" AND NOT EXISTS (SELECT 1 FROM roll_day_dim r "
-                         "WHERE r.dim=? AND r.val_id=d.id)")
-            params = (dim,)
-        sql = ("DELETE FROM %s WHERE id IN (SELECT d.id FROM %s d "
-               "WHERE NOT EXISTS (SELECT 1 FROM event e WHERE e.%s = d.id)%s LIMIT ?)"
-               % (table, table, col, keep_roll))
+            con.execute("INSERT OR IGNORE INTO temp.referenced(id) SELECT DISTINCT val_id "
+                        "FROM roll_day_dim WHERE dim=?", (dim,))
+        sql = ("DELETE FROM %s WHERE id IN (SELECT d.id FROM %s d WHERE NOT EXISTS "
+               "(SELECT 1 FROM temp.referenced r WHERE r.id = d.id) LIMIT ?)" % (table, table))
         total = 0
         while True:
             con.execute("BEGIN")
-            cur = con.execute(sql, params + (BATCH,))
+            cur = con.execute(sql, (BATCH,))
             n = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
             con.execute("COMMIT")
             total += n
             if n < BATCH:
                 break
         out[table] = total
+    con.execute("DROP TABLE IF EXISTS temp.referenced")
     return out
 
 

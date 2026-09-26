@@ -361,6 +361,12 @@ known one, see `etc/linkstack/docker-compose.yml`.
 your logs disagree about something. Run `hails-verify.py` by hand to see which check fell over. It
 prints what it compared and what it found, and it is safe to run any time since it only reads.
 
+If it says a fingerprint is held by more than one source row, a log was read twice.
+`hails-dedupe.py` shows what it would remove and `hails-dedupe.py --apply` removes it. The
+bandwidth history keeps the larger of old and new values, so correct it too with
+`hails-rollup.py --from-db --rewrite-from YYYY-MM-DD`, giving the first day that was affected. Add
+`--dry-run` first to see the change.
+
 **Numbers stopped moving.** Look at `systemctl status hails-ingest.service` first. If the ingest has
 stalled, the pages fall back to reading the log and carry on, so the symptom is usually staleness in
 the long windows rather than an obvious error.

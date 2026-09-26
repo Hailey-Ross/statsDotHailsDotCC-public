@@ -120,7 +120,9 @@ def candidates():
         log("cannot list %s: %s" % (LOG_DIR, e))
         return []
     for n in sorted(names):
-        if not (n == "access.log" or (n.startswith("access-") and ".log" in n)):
+        # Not ".log" anywhere in the name: Caddy compresses through "<name>.log.gz.tmp".
+        if not (n == "access.log"
+                or (n.startswith("access-") and (n.endswith(".log") or n.endswith(".log.gz")))):
             continue
         p = os.path.join(LOG_DIR, n)
         try:
@@ -162,6 +164,26 @@ def new_gen(con, dev, inode, gen, path, size, fp, why):
                        (dev, inode, gen + 1, path, fp, size, int(time.time()))).lastrowid
 
 
+def adopt_by_fp(con, dev, inode, path, fp):
+    if fp is None:
+        return None
+    r = con.execute("SELECT id, offset, gen, done, path FROM source WHERE fp=? "
+                    "ORDER BY gen DESC LIMIT 1", (fp,)).fetchone()
+    if r is None:
+        return None
+    sid, off, gen, done, oldpath = r
+    # Retire rows left on this inode by gone files, or the move below hits UNIQUE(dev, inode, gen).
+    stale = con.execute("UPDATE source SET dev=0, inode=-id WHERE dev=? AND inode=? AND id!=?",
+                        (dev, inode, sid)).rowcount
+    if stale:
+        log("%s: retired %d stale source row(s) left on its inode by an earlier file"
+            % (os.path.basename(path), stale))
+    con.execute("UPDATE source SET dev=?, inode=?, path=? WHERE id=?", (dev, inode, path, sid))
+    log("%s is %s under a new inode (compressed or relinked), resuming its cursor at %d"
+        % (os.path.basename(path), os.path.basename(oldpath or "?"), off))
+    return sid, off, gen, done
+
+
 def source_row(con, dev, inode, path, size, fp):
     """Find this file's cursor, or start one. Returns (id, offset, gen, done).
 
@@ -176,6 +198,9 @@ def source_row(con, dev, inode, path, size, fp):
             con.execute("UPDATE source SET fp=? WHERE id=?", (fp, sid))
             oldfp = fp
         if fp is not None and oldfp is not None and oldfp != fp:
+            got = adopt_by_fp(con, dev, inode, path, fp)
+            if got is not None:
+                return got
             return new_gen(con, dev, inode, gen, path, size, fp, "inode reused by different content"), \
                 0, gen + 1, 0
         if size is not None and size < off:
@@ -185,19 +210,9 @@ def source_row(con, dev, inode, path, size, fp):
         return sid, off, gen, done
 
     # Unknown inode: this may still be the compressed copy of a file already read.
-    if fp is not None:
-        r2 = con.execute("SELECT id, offset, gen, done, path FROM source WHERE fp=? "
-                         "ORDER BY gen DESC LIMIT 1", (fp,)).fetchone()
-        if r2 is not None:
-            sid, off, gen, done, oldpath = r2
-            try:
-                con.execute("UPDATE source SET dev=?, inode=?, path=? WHERE id=?",
-                            (dev, inode, path, sid))
-            except Exception:
-                pass
-            log("%s is %s under a new inode (compressed or relinked), resuming its cursor at %d"
-                % (os.path.basename(path), os.path.basename(oldpath or "?"), off))
-            return sid, off, gen, done
+    got = adopt_by_fp(con, dev, inode, path, fp)
+    if got is not None:
+        return got
 
     sid = con.execute("INSERT INTO source(dev,inode,gen,path,fp,offset,size,updated) "
                       "VALUES(?,?,0,?,?,0,?,?)",

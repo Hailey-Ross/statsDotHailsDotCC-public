@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
-"""Verify the events warehouse against a fresh pass over the raw logs. Run daily; exit 1 means the
-warehouse is behind the log or an internal invariant failed.
-
-File discovery is deliberately not imported from the ingest, because file discovery is the thing
-under test. Normalization is imported, because it is definitional here rather than a claim.
-"""
 import sys
 import os
-import re
 import json
 import gzip
 import time
@@ -62,7 +55,10 @@ def discover():
     for p in glob.glob(os.path.join(LOG_DIR, "access*")):
         if not os.path.isfile(p):
             continue
-        if not re.search(r"access[-.].*log|access\.log", os.path.basename(p)):
+        n = os.path.basename(p)
+        # Must match the ingest's rule in candidates().
+        if not (n == "access.log"
+                or (n.startswith("access-") and (n.endswith(".log") or n.endswith(".log.gz")))):
             continue
         try:
             st = os.stat(p)
@@ -72,19 +68,45 @@ def discover():
     return found
 
 
+def file_fp(p):
+    try:
+        with (gzip.open if p.endswith(".gz") else open)(p, "rb") as fh:
+            return db.fingerprint(fh.read(db.FP_BYTES))
+    except Exception:
+        return None
+
+
 def check_files(con, found):
-    known = {}
-    # Ordered by gen so the newest generation of a truncated file wins.
-    for dev, ino, path, off, size, done in con.execute(
-            "SELECT dev, inode, path, offset, size, done FROM source ORDER BY gen"):
-        known[(dev, ino)] = (path, off, size, done)
-    missed = [p for k, p in found.items() if k not in known]
+    """Inode numbers are reused, so only a row with a matching fingerprint answers for a file."""
+    rows = collections.defaultdict(list)
+    for dev, ino, gen, path, fp, off, size, done in con.execute(
+            "SELECT dev, inode, gen, path, fp, offset, size, done FROM source ORDER BY gen"):
+        rows[(dev, ino)].append((gen, path, fp, off, size, done))
+    known, missed, wrong = {}, [], []
+    for k, p in found.items():
+        cands = rows.get(k)
+        if not cands:
+            missed.append(p)
+            continue
+        fp = file_fp(p)
+        mine = [c for c in cands if fp is None or c[2] is None or c[2] == fp]
+        if not mine:
+            wrong.append(p)
+            continue
+        _gen, path, _fp, off, size, done = mine[-1]
+        known[k] = (path, off, size, done)
     if missed:
         fail("%d log file(s) on disk that the ingester never opened: %s"
              % (len(missed), ", ".join(os.path.basename(m) for m in sorted(missed))))
     else:
         ok("every access log on disk (%d) has a cursor" % len(found))
-    gone = [v[0] for k, v in known.items() if k not in found]
+    if wrong:
+        fail("%d log file(s) whose inode is held only by cursors for OTHER content (a reused inode "
+             "the ingest never adopted): %s"
+             % (len(wrong), ", ".join(os.path.basename(m) for m in sorted(wrong))))
+    here = set(found.values())
+    gone = sorted({c[1] for k, cs in rows.items() if k not in found for c in cs
+                   if c[1] and c[1] not in here})
     if gone:
         warn("%d ingested file(s) no longer on disk (rotated away). The warehouse now holds history "
              "the log cannot: %s" % (len(gone), ", ".join(os.path.basename(g) for g in sorted(gone))))
@@ -125,11 +147,6 @@ def lines_upto(fh, limit):
 
 
 def read_logs(found, limits):
-    """Every line of every discovered log, oldest file first, normalized through the shared code.
-
-    Bounded by the ingest's committed cursor for each file, since traffic keeps arriving while this
-    runs and an unbounded read would report the difference as missing rows.
-    """
     def mtime(p):
         try:
             return os.path.getmtime(p)
@@ -156,9 +173,6 @@ def read_logs(found, limits):
                     req, host = PRE.normalize(o)
                     if not isinstance(host, str) or not host:
                         continue
-                    # The baseline must apply the same drop and mask rules the ingest applied, or
-                    # this check reports dropped and masked rows as data the warehouse lost. It is a
-                    # recomputation of what should have been stored, not of the raw file.
                     if PRE.is_dropped(host, req, DROP_HOSTS):
                         continue
                     PRE.mask_probe(req, PROBE_PATHS)
@@ -173,8 +187,11 @@ def read_logs(found, limits):
 def scan(found, limits):
     day = collections.defaultdict(lambda: [0, 0, 0, 0, set()])   # (day,host) -> h,v,f,bytes,ips
     hour = collections.defaultdict(lambda: [0, 0])               # (hour,host) -> hits,bytes
-    uri = collections.defaultdict(collections.Counter)           # host -> Counter(uri)
+    uri = collections.defaultdict(collections.Counter)           # (day,host) -> Counter(uri)
+    span = [None, None]
     for o, req, host, ts in read_logs(found, limits):
+        span[0] = ts if span[0] is None else min(span[0], ts)
+        span[1] = ts if span[1] is None else max(span[1], ts)
         try:
             st = int(o.get("status") or 0)
         except Exception:
@@ -194,13 +211,11 @@ def scan(found, limits):
         h[0] += 1
         h[1] += sz
         u = req.get("uri") or ""
-        uri[host][u[:512]] += 1
-    return day, hour, uri
+        uri[(d, host)][u[:512]] += 1
+    return day, hour, uri, tuple(span)
 
 
 def loss_evidence(con, found):
-    """Reasons the warehouse may legitimately hold more than the log. Absent any of them, holding
-    more is double counting and must fail."""
     reasons = []
     live = {(d, i) for (d, i) in found}
     for dev, ino, path in con.execute("SELECT dev, inode, path FROM source"):
@@ -211,7 +226,34 @@ def loss_evidence(con, found):
     return reasons
 
 
-def compare_days(con, logday, explained):
+def covered(span):
+    """Only the log's first and last day may be short of the warehouse."""
+    lo, hi = span
+    if lo is None or hi is None:
+        return set(), "nothing"
+    lo_day, hi_day = db.day_of(lo), db.day_of(hi)
+    days = set()
+    d = lo_day
+    while d < hi_day:
+        d = db.day_of(db.day_bounds(d)[1])
+        if d < hi_day:
+            days.add(d)
+    if not days:
+        return set(), "no whole day (the log spans %s to %s)" % (db.day_str(lo_day),
+                                                                 db.day_str(hi_day))
+    return days, "%d whole day(s), %s to %s (%s and %s are partial at the edges)" % (
+        len(days), db.day_str(min(days)), db.day_str(max(days)),
+        db.day_str(lo_day), db.day_str(hi_day))
+
+
+def split_excuse(pairs, full_days, dayof):
+    fine, bad = [], []
+    for item in pairs:
+        (bad if dayof(item) in full_days else fine).append(item)
+    return fine, bad
+
+
+def compare_days(con, logday, explained, full_days):
     dbday = {}
     for d, host, hits, valid, failed, byt, uv in con.execute(
             "SELECT r.day, h.host, r.hits, r.valid, r.failed, r.bytes, r.uv_nonadditive "
@@ -244,77 +286,106 @@ def compare_days(con, logday, explained):
         ok("no day/host pair is behind the log")
     if equal:
         ok("%d day/host pair(s) match exactly (hits, valid, failed, bytes, uniques)" % equal)
-    if ahead:
-        report = warn if explained else fail
-        report("%d day/host pair(s) where the warehouse has MORE than the log.%s"
-               % (len(ahead),
-                  (" Explained by: " + "; ".join(explained)) if explained
-                  else " Nothing explains this. Suspect DOUBLE COUNTING."))
-        for k, want, got in ahead[:10]:
+    edge, inside = split_excuse(ahead, full_days, lambda t: t[0][0])
+    if inside:
+        fail("%d day/host pair(s) where the warehouse has MORE than the log on a day the log holds "
+             "IN FULL. Nothing explains this. Suspect DOUBLE COUNTING." % len(inside))
+        for k, want, got in inside[:10]:
             print("        %s %-22s log=%s db=%s" % (db.day_str(k[0]), k[1], want, got))
-    if extra:
-        warn("%d day/host pair(s) in the warehouse with nothing in the log at all: %s"
-             % (len(extra), ", ".join("%s/%s" % (db.day_str(d), h) for d, h in extra[:6])))
+    if edge:
+        warn("%d day/host pair(s) ahead of the log only on its partial edge days, which is the "
+             "warehouse being deeper than the log. Explained by: %s"
+             % (len(edge), "; ".join(explained) if explained else "log retention"))
+        for k, want, got in edge[:4]:
+            print("        %s %-22s log=%s db=%s" % (db.day_str(k[0]), k[1], want, got))
+    if not ahead:
+        ok("no day/host pair is ahead of the log")
+
+    edge_x, inside_x = split_excuse(extra, full_days, lambda k: k[0])
+    if inside_x:
+        fail("%d day/host pair(s) in the warehouse on a day the log holds IN FULL, with nothing in "
+             "the log at all: %s" % (len(inside_x),
+                                     ", ".join("%s/%s" % (db.day_str(d), h) for d, h in inside_x[:6])))
+    if edge_x:
+        warn("%d day/host pair(s) in the warehouse with nothing in the log at all, all outside the "
+             "log's full coverage: %s"
+             % (len(edge_x), ", ".join("%s/%s" % (db.day_str(d), h) for d, h in edge_x[:6])))
 
 
-def compare_hours(con, loghour, explained):
+def compare_hours(con, loghour, explained, full_days):
     dbhour = {}
     for hr, host, hits, byt in con.execute(
             "SELECT r.hour, h.host, r.hits, r.bytes FROM roll_hour r JOIN dim_host h ON h.id = r.host_id"):
         dbhour[(hr, host)] = (hits, byt)
-    low = high = 0
+    low = high_edge = high_inside = 0
+    shown = 0
     for k, v in loghour.items():
         got = dbhour.get(k)
         if got is None:
-            continue          # covered by the day comparison
-        if got[0] != v[0]:
-            if got[0] < v[0]:
-                low += 1
-            else:
-                high += 1
-            if low + high <= 5:
-                print("        hour %d %-20s log=%s db=%s" % (k[0], k[1], tuple(v), got))
+            continue
+        if got[0] == v[0]:
+            continue
+        inside = (k[0] // 100) in full_days
+        if got[0] < v[0]:
+            low += 1
+        elif inside:
+            high_inside += 1
+        else:
+            high_edge += 1
+        if shown < 5 and (low or high_inside):
+            shown += 1
+            print("        hour %d %-20s log=%s db=%s" % (k[0], k[1], tuple(v), got))
     if low:
         fail("%d hour bucket(s) behind the log: SQL localtime and Python localtime disagree" % low)
-    if high and not explained:
-        fail("%d hour bucket(s) AHEAD of the log with nothing to explain it: suspect double counting"
-             % high)
-    elif high:
-        warn("%d hour bucket(s) ahead of the log (%s)" % (high, "; ".join(explained)))
-    if not low and not high:
+    if high_inside:
+        fail("%d hour bucket(s) AHEAD of the log inside its full coverage: suspect double counting"
+             % high_inside)
+    if high_edge:
+        warn("%d hour bucket(s) ahead of the log on its partial edge days (%s)"
+             % (high_edge, "; ".join(explained) if explained else "log retention"))
+    if not low and not high_inside and not high_edge:
         ok("hour bucketing agrees between SQL and Python (%d buckets)" % len(dbhour))
 
 
-def compare_uris(con, loguri, explained):
-    """Top N URIs per host. Catches interning mistakes that aggregate totals cannot see, in
-    particular the host prefixed uri leaking into dim_uri and splitting one URL into two."""
+def compare_uris(con, loguri, full_days):
+    # Only over the days the log holds in full, or a deeper warehouse always looks ahead.
+    if not full_days:
+        warn("the log holds no whole day, so there is nothing to check the top URIs against")
+        return
+    byhost = collections.defaultdict(collections.Counter)
+    for (d, host), c in loguri.items():
+        if d in full_days:
+            byhost[host].update(c)
+    if not byhost:
+        warn("no log lines fall on a day the log holds in full")
+        return
+
+    days = sorted(full_days)
+    q = ",".join("?" * len(days))
     bad = over = 0
-    for host, counter in loguri.items():
-        # TOPN + 1, because the sentinel is skipped below and is top one on every host.
-        for u, n in counter.most_common(TOPN + 1):
+    for host, counter in sorted(byhost.items()):
+        for u, n in counter.most_common(TOPN):
             if u.endswith(PRE.PROBE_SENTINEL):
                 continue
             row = con.execute(
                 "SELECT COALESCE(SUM(d.hits), 0) FROM roll_day_dim d JOIN dim_uri x ON x.id = d.val_id "
-                "JOIN dim_host h ON h.id = d.host_id WHERE d.dim = ? AND h.host = ? AND x.uri = ?",
-                (db.D_URI, host, u)).fetchone()
+                "JOIN dim_host h ON h.id = d.host_id WHERE d.dim = ? AND h.host = ? AND x.uri = ? "
+                "AND d.day IN (%s)" % q, [db.D_URI, host, u] + days).fetchone()
             g = row[0] if row else 0
             if g != n:
                 bad += 1
                 over = over + 1 if g > n else over
                 if bad <= 5:
                     print("        %-20s %-45s log=%d db=%s" % (host, u[:45], n, g))
-    if bad and (over == 0 or not explained):
-        fail("%d top URI row(s) disagree with the log (%d of them ahead)" % (bad, over))
-    elif bad:
-        warn("%d top URI row(s) ahead of the log (%s)" % (bad, "; ".join(explained)))
+    if bad:
+        fail("%d top URI row(s) disagree with the log over the %d day(s) it holds in full "
+             "(%d of them ahead)" % (bad, len(days), over))
     else:
-        ok("top %d URIs per host agree for %d host(s)" % (TOPN, len(loguri)))
+        ok("top %d URIs per host agree over the log's %d full day(s), %d host(s)"
+           % (TOPN, len(days), len(byhost)))
 
 
 def check_internal(con):
-    # Scoped to days that still have raw events and no legacy contribution, since rollups outlive the
-    # events they were built from.
     edays = [d for (d,) in con.execute("SELECT DISTINCT day FROM event")]
     impure = {d for (d,) in con.execute("SELECT DISTINCT day FROM roll_day WHERE source <> 'raw'")}
     days = [d for d in edays if d not in impure]
@@ -352,7 +423,6 @@ def check_internal(con):
         if not bad_dim:
             ok("all %d dimensions sum back to roll_day (the tail fold is not lossy)" % ndim)
 
-    # A 0 val_id may only appear in D_STATUS, where it means an aborted connection.
     stray = con.execute("SELECT COUNT(*) FROM roll_day_dim WHERE val_id=0 AND dim<>?",
                         (db.D_STATUS,)).fetchone()[0]
     if stray:
@@ -360,8 +430,6 @@ def check_internal(con):
     else:
         ok("val_id 0 appears only where it means HTTP status 0")
 
-    # Scoped to days that still have events. This is sound only because the prune deletes whole days:
-    # a day cut mid way would still appear in DISTINCT day and fail on a fragment.
     bad = 0
     for d, hid, blob, uv in con.execute(
             "SELECT day, host_id, visitors, uv_nonadditive FROM roll_day WHERE source='raw' "
@@ -377,12 +445,27 @@ def check_internal(con):
     else:
         ok("every visitor blob round trips to the exact distinct IP set")
 
+    dupfp = con.execute(
+        "SELECT COUNT(*) FROM (SELECT fp FROM source WHERE fp IS NOT NULL "
+        "GROUP BY fp HAVING COUNT(*) > 1)").fetchone()[0]
+    if dupfp:
+        rows = con.execute(
+            "SELECT s.id, s.path FROM source s WHERE s.fp IN (SELECT fp FROM source "
+            "WHERE fp IS NOT NULL GROUP BY fp HAVING COUNT(*) > 1) ORDER BY s.fp, s.id "
+            "LIMIT 6").fetchall()
+        fail("%d fingerprint(s) held by more than one source row: the same log has been read under "
+             "two cursors and its rows are in here twice. Run hails-dedupe.py." % dupfp)
+        for sid, path in rows:
+            print("        src %-4d %s" % (sid, os.path.basename(path or "?")))
+    else:
+        ok("every fingerprint is held by exactly one source row (no log read twice)")
+
     dup = con.execute("SELECT COUNT(*) FROM (SELECT src_id, src_off FROM event "
                       "GROUP BY src_id, src_off HAVING COUNT(*) > 1)").fetchone()[0]
     if dup:
         fail("%d duplicated (src_id, src_off): the identity index is not doing its job" % dup)
     else:
-        ok("no duplicate source offsets")
+        ok("the (src_id, src_off) identity index holds")
 
     tz = db.get_meta(con, "tz_name")
     if tz != db.tz_name():
@@ -416,12 +499,15 @@ def main():
     known = check_files(con, found)
     limits = {k: v[1] for k, v in known.items()}
     print("      scanning %d log file(s), bounded by the ingest cursor..." % len(found))
-    logday, loghour, loguri = scan(found, limits)
+    logday, loghour, loguri, span = scan(found, limits)
+
+    full_days, describe = covered(span)
+    print("      the log holds %s: discrepancies there are failures, not notes" % describe)
 
     explained = loss_evidence(con, found)
-    compare_days(con, logday, explained)
-    compare_hours(con, loghour, explained)
-    compare_uris(con, loguri, explained)
+    compare_days(con, logday, explained, full_days)
+    compare_hours(con, loghour, explained, full_days)
+    compare_uris(con, loguri, full_days)
     check_internal(con)
 
     print("\n%d ok, %d note(s), %d failure(s), %.1fs" % (len(OK), len(WARN), len(FAIL), time.time() - t0))
