@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-# Durable per day, per host bandwidth history, merged into /var/lib/hails-stats/bandwidth.json.
-# Counts come from --tally FILE, or from the preprocessed JSON log on stdin when it is not given.
-#
-# Merge rule is max(stored, fresh) per host per day, never sum: the whole log set is reparsed every
-# run, so summing would multiply every historical day by the number of runs.
-import sys, json, os, time
+# Merge rule is max(stored, fresh) per host per day, never sum: every run recounts the same days.
+import sys, json, os, time, fcntl
 
 STORE = os.environ.get("HAILS_ROLLUP", "/var/lib/hails-stats/bandwidth.json")
 
@@ -16,7 +12,41 @@ if "--tally" in sys.argv:
         sys.exit(2)
     TALLY = sys.argv[i + 1]
 
-# fresh[host][day] = [bytes, hits]
+FROM_DB = "--from-db" in sys.argv
+if FROM_DB and TALLY:
+    sys.stderr.write("hails-rollup: --from-db and --tally are alternatives, pass one\n")
+    sys.exit(2)
+
+DRY = "--dry-run" in sys.argv
+
+# --rewrite-from replaces stored days instead of taking max(). For repairs, never on a schedule.
+REWRITE_FROM = None
+if "--rewrite-from" in sys.argv:
+    i = sys.argv.index("--rewrite-from")
+    if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith("-"):
+        sys.stderr.write("hails-rollup: --rewrite-from needs a YYYY-MM-DD date\n")
+        sys.exit(2)
+    REWRITE_FROM = sys.argv[i + 1]
+    try:
+        time.strptime(REWRITE_FROM, "%Y-%m-%d")
+    except ValueError:
+        sys.stderr.write("hails-rollup: --rewrite-from %r is not a YYYY-MM-DD date\n" % REWRITE_FROM)
+        sys.exit(2)
+    if not FROM_DB:
+        sys.stderr.write("hails-rollup: --rewrite-from needs --from-db. The tally and the stdin path "
+                         "see only the retained logs, so anything older would be "
+                         "rewritten to nothing\n")
+        sys.exit(2)
+
+FORGET = set()
+for i, a in enumerate(sys.argv):
+    if a == "--forget-host" and i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
+        FORGET.add(sys.argv[i + 1])
+if FORGET and not REWRITE_FROM:
+    sys.stderr.write("hails-rollup: --forget-host only runs alongside --rewrite-from, so a routine "
+                     "merge can never drop a host\n")
+    sys.exit(2)
+
 fresh = {}
 if TALLY:
     try:
@@ -38,6 +68,54 @@ if TALLY:
                 continue
         if out:
             fresh[host] = out
+elif FROM_DB:
+    def seeded():
+        try:
+            with open(STORE, "r", encoding="utf-8") as fh:
+                return bool((json.load(fh) or {}).get("hosts"))
+        except Exception:
+            return False
+
+    def read_warehouse():
+        import hails_query as hq   # noqa: E402
+        import hails_db as hdb     # noqa: E402
+        if not os.path.exists(hdb.DB_PATH):
+            raise IOError("no warehouse at %s" % hdb.DB_PATH)
+        con = hq.connect()
+        dropped = hq.drop_hosts()
+        out = {}
+        for day, host, by, hits in con.execute(
+                "SELECT r.day, h.host, r.bytes, r.hits "
+                "FROM roll_day r JOIN dim_host h ON h.id = r.host_id"):
+            if not host:
+                continue
+            if dropped and any(host.startswith(p) for p in dropped):
+                continue
+            try:
+                by, hits = int(by or 0), int(hits or 0)
+            except (TypeError, ValueError):
+                continue
+            if hits <= 0:
+                continue
+            out.setdefault(host, {})[hdb.day_str(day)] = [by, hits]
+        return out
+
+    HERE = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, HERE)
+    try:
+        fresh = read_warehouse()
+    except Exception as e:
+        if seeded():
+            sys.stderr.write("hails-rollup: cannot read the warehouse: %s\n" % e)
+            sys.exit(1)
+        sys.stderr.write("hails-rollup: no readable warehouse yet (%s) and no stored history, "
+                         "nothing to merge\n" % e)
+        sys.exit(0)
+
+    if not fresh and not seeded():
+        sys.stderr.write("hails-rollup: warehouse holds no rollup rows yet and there is no stored "
+                         "history, nothing to merge\n")
+        sys.exit(0)
 else:
     for line in sys.stdin:
         line = line.strip()
@@ -60,8 +138,7 @@ else:
             by = int(o.get("size") or 0)
         except Exception:
             by = 0
-        # This bucketing must stay identical to the preprocessor's, or the two paths disagree about
-        # which day a request belongs to and the merge freezes the boundary permanently.
+        # Must bucket exactly as the preprocessor does, or the merge freezes the day boundary.
         day = time.strftime("%Y-%m-%d", time.localtime(ts))
         d = fresh.setdefault(host, {})
         rec = d.get(day)
@@ -71,12 +148,28 @@ else:
             rec[0] += by
             rec[1] += 1
 
-# Merging an empty pass would rewrite every historical day unchanged and exit 0, which is
-# indistinguishable from a healthy run while today stops growing.
 if not fresh:
+    why = ("the warehouse returned no rollup rows" if FROM_DB else
+           "tally missing or stdin empty?")
     sys.stderr.write("hails-rollup: fresh pass counted nothing, refusing to merge and leaving %s "
-                     "untouched (tally missing or stdin empty?)\n" % STORE)
+                     "untouched (%s)\n" % (STORE, why))
     sys.exit(1)
+
+LOCK = STORE + ".lock"
+LOCK_TIMEOUT_S = 10.0
+os.makedirs(os.path.dirname(LOCK) or ".", exist_ok=True)
+lockfh = open(LOCK, "w")
+deadline = time.time() + LOCK_TIMEOUT_S
+while True:
+    try:
+        fcntl.flock(lockfh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except OSError:
+        if time.time() >= deadline:
+            sys.stderr.write("hails-rollup: could not take the write lock on %s within %.0fs, "
+                             "leaving %s untouched\n" % (LOCK, LOCK_TIMEOUT_S, STORE))
+            sys.exit(1)
+        time.sleep(0.1)
 
 old = {}
 try:
@@ -89,19 +182,65 @@ except Exception:
 
 merged = {}
 for host in set(old) | set(fresh):
+    if host in FORGET:
+        continue
     o_days = old.get(host) or {}
     f_days = fresh.get(host) or {}
     out = {}
     for day in set(o_days) | set(f_days):
         ob = o_days.get(day) or [0, 0]
-        fb = f_days.get(day) or [0, 0]
+        fb = f_days.get(day)
         try:
             ob = [int(ob[0]), int(ob[1])]
         except Exception:
             ob = [0, 0]
-        out[day] = [max(ob[0], fb[0]), max(ob[1], fb[1])]
+        if REWRITE_FROM is not None and day >= REWRITE_FROM:
+            if fb is None:
+                continue
+            out[day] = [int(fb[0]), int(fb[1])]
+        else:
+            fb = fb or [0, 0]
+            out[day] = [max(ob[0], fb[0]), max(ob[1], fb[1])]
     if out:
         merged[host] = out
+
+if REWRITE_FROM is not None:
+    def total(hosts):
+        return (sum(v[0] for d in hosts.values() for v in d.values()),
+                sum(v[1] for d in hosts.values() for v in d.values()))
+
+    ob, oh = total(old)
+    nb, nh = total(merged)
+    sys.stderr.write("hails-rollup: rewriting from %s%s\n"
+                     % (REWRITE_FROM, (", forgetting " + ", ".join(sorted(FORGET))) if FORGET else ""))
+    for host in sorted(set(old) | set(merged)):
+        a = old.get(host) or {}
+        b = merged.get(host) or {}
+        dh = sum(v[1] for v in b.values()) - sum(v[1] for v in a.values())
+        if dh:
+            sys.stderr.write("hails-rollup:   %-22s hits %+d\n" % (host, dh))
+    sys.stderr.write("hails-rollup: total hits %d -> %d (%+d), bytes %.1f GB -> %.1f GB\n"
+                     % (oh, nh, nh - oh, ob / 1e9, nb / 1e9))
+    if DRY:
+        sys.stderr.write("hails-rollup: dry run, %s left untouched\n" % STORE)
+        fcntl.flock(lockfh, fcntl.LOCK_UN)
+        lockfh.close()
+        sys.exit(0)
+    bak = "%s.pre-rewrite.%s" % (STORE, time.strftime("%Y%m%d-%H%M%S"))
+    try:
+        with open(STORE, "rb") as a, open(bak, "wb") as b:
+            b.write(a.read())
+        sys.stderr.write("hails-rollup: backed up to %s\n" % bak)
+    except Exception as e:
+        sys.stderr.write("hails-rollup: could not back up %s: %s, refusing to rewrite\n" % (STORE, e))
+        fcntl.flock(lockfh, fcntl.LOCK_UN)
+        lockfh.close()
+        sys.exit(1)
+elif DRY:
+    sys.stderr.write("hails-rollup: --dry-run only applies to --rewrite-from\n")
+    fcntl.flock(lockfh, fcntl.LOCK_UN)
+    lockfh.close()
+    sys.exit(2)
 
 days_seen = [d for h in merged.values() for d in h]
 doc = {
@@ -111,7 +250,24 @@ doc = {
 }
 
 os.makedirs(os.path.dirname(STORE) or ".", exist_ok=True)
-tmp = STORE + ".tmp"
-with open(tmp, "w", encoding="utf-8") as fh:
-    json.dump(doc, fh, separators=(",", ":"), sort_keys=True)
-os.replace(tmp, STORE)
+tmp = "%s.tmp.%d" % (STORE, os.getpid())
+try:
+    import glob
+    for stale in glob.glob(STORE + ".tmp.*"):
+        try:
+            os.unlink(stale)
+        except OSError:
+            pass
+except Exception:
+    pass
+try:
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, separators=(",", ":"), sort_keys=True)
+    os.replace(tmp, STORE)
+finally:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    fcntl.flock(lockfh, fcntl.LOCK_UN)
+    lockfh.close()
