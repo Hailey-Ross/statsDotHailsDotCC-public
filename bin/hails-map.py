@@ -102,6 +102,9 @@ def strip_nested(text):
     return "".join(out)
 
 
+REDIR_CODE = re.compile(r"^(?:\d{3}|permanent|temporary|html)$")
+
+
 def classify(header, body):
     if not header or header.startswith("("):
         return None
@@ -121,9 +124,17 @@ def classify(header, body):
     if m:
         root = m.group(1)
     redir = None
-    m = re.search(r"\bredir\s+(\S+)(?:\s+(\S+))?", top)
-    if m:
-        redir = (m.group(1), m.group(2) or "302")
+    # A redir with a matcher is a route inside the site, not the site's role.
+    for m in re.finditer(r"\bredir\s+(\S+)(?:\s+(\S+))?(?:\s+(\S+))?", top):
+        target, code = m.group(1), m.group(2)
+        if target == "*":
+            target, code = m.group(2), m.group(3)
+        elif target.startswith(("@", "/")):
+            continue
+        if not target:
+            continue
+        redir = (target, code if code and REDIR_CODE.match(code) else "302")
+        break
     top_proxy = re.search(r"\breverse_proxy\s+(\S+)", top)
     proxies = re.findall(r"\breverse_proxy\s+(\S+)", text)
     subroutes = []
@@ -324,7 +335,7 @@ def shorten(target):
 
 def redir_code(h):
     code = (h.get("redir") or ("", "302"))[1]
-    return {"permanent": "301", "temporary": "302"}.get(code, code)
+    return {"permanent": "301", "temporary": "302", "html": "meta"}.get(code, code)
 
 
 def backend_cell(h):
@@ -363,7 +374,8 @@ def build_table(hosts):
         rows += ("<tr><td class=lbl>%s</td><td>%s</td><td class=lbl>%s</td><td>%s</td><td>%s</td>"
                  "<td class=lbl>%s</td></tr>") % (esc(title), esc(h["role"]), backend_cell(h), tls, cf,
                                                   notes_cell(h))
-    return ("<div class=card><div class=tw><table><thead><tr><th>Host</th><th>Role</th>"
+    # Not sortable in build_public_table: /table.js is not served there.
+    return ("<div class=\"card sortable\"><div class=tw><table><thead><tr><th>Host</th><th>Role</th>"
             "<th>Backend or Target</th><th>TLS</th><th>Cloudflare</th><th>Notes</th></tr></thead>"
             "<tbody>" + rows + "</tbody></table></div></div>")
 
@@ -416,6 +428,7 @@ __TABLE__
 <p class=foot>Generated from the live Caddyfile on __STAMP__. Cloudflare proxied versus grey is inferred from whether a host uses a Cloudflare Origin CA certificate, not confirmed from DNS. All times server local.</p>
 </div>
 <script src="/nav.js"></script>
+<script src="/table.js"></script>
 """
 
 

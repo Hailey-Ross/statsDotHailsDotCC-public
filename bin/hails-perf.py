@@ -237,7 +237,7 @@ def tile(k, val, sub=""):
             "<div class=d>%s</div></div>" % (esc(k), val, sub))
 
 
-def section(title, note, head, rows, sub=None):
+def section(title, note, head, rows, sub=None, sortable=False):
     if not rows:
         return ""
     h = ["<h2>%s</h2>" % esc(title)]
@@ -245,11 +245,12 @@ def section(title, note, head, rows, sub=None):
         h.append("<p class=sub2>%s</p>" % esc(sub))
     if note:
         h.append("<p class=note>%s</p>" % note)
-    h.append("<div class=card><div class=tw><table><tr>")
+    h.append("<div class=\"card sortable\">" if sortable else "<div class=card>")
+    h.append("<div class=tw><table><thead><tr>")
     h.append("".join("<th>%s</th>" % esc(c) for c in head))
-    h.append("</tr>")
+    h.append("</tr></thead><tbody>")
     h.extend(rows)
-    h.append("</table></div></div>")
+    h.append("</tbody></table></div></div>")
     return "".join(h)
 
 
@@ -470,22 +471,28 @@ def services():
         cells = []
         for span in (86400, 604800, 2592000):
             a = avail(n, span)
-            cells.append("<td class=nd>collecting</td>" if a is None else
-                         "<td class=%s>%s</td>" % ("ok" if a >= 99.5 else "bad", "%.2f%%" % a))
+            # Every cell needs data-s, or one "collecting" cell turns the column into a string sort.
+            cells.append("<td class=nd data-s=\"-1\">collecting</td>" if a is None else
+                         "<td class=%s data-s=\"%.4f\">%s</td>"
+                         % ("ok" if a >= 99.5 else "bad", a, "%.2f%%" % a))
         lat = latency(n) if kind == "http" else None
-        rows.append("<tr><td class=lbl>%s</td><td>%s</td><td class=%s>%s</td><td>%s</td><td>%s</td>"
-                    "%s<td>%s</td></tr>"
+        rows.append("<tr><td class=lbl>%s</td><td>%s</td><td class=%s>%s</td>"
+                    "<td data-s=\"%d\">%s</td><td data-s=\"%d\">%s</td>"
+                    "%s<td data-s=\"%.0f\">%s</td></tr>"
                     % (esc(n), esc(kind), "ok" if ok else "bad", esc(state),
-                       esc(stamp(since)) if since else "", esc(run),
-                       "".join(cells), ("%.0f ms" % lat) if lat is not None else ""))
+                       since, esc(stamp(since)) if since else "",
+                       (NOW - since) if since else -1, esc(run),
+                       "".join(cells), lat if lat is not None else -1,
+                       ("%.0f ms" % lat) if lat is not None else ""))
     return section(
         "Service uptime",
         "systemd and docker report exactly when each service last started. The http rows probe each "
         "site over the network against the status it is expected to return, so a redirect or an auth "
         "challenge counts as healthy. Both are shown because a proxy can answer while the app behind "
         "it is down.",
+        # Only sortable table here: elsewhere the rows are time windows and their order is the axis.
         ["Service", "Source", "State", "Started", "Running", "24 hours", "7 days", "30 days",
-         "Avg latency"], rows)
+         "Avg latency"], rows, sortable=True)
 
 
 BODY = build()
@@ -550,6 +557,7 @@ SUB = TITLE + " : Performance"
 OUT = ("<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,"
        "initial-scale=1\">\n<title>%s</title>\n%s\n%s\n<div class=wrap>\n<h1>%s</h1>\n"
        "%s\n<div class=foot>%s</div>\n</div>\n<script src=\"/nav.js\"></script>\n"
+       "<script src=\"/table.js\"></script>\n"
        % (esc(SUB), FAVICON, STYLE, esc(SUB), BODY, foot))
 
 os.makedirs(OUTDIR, exist_ok=True)

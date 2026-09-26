@@ -43,6 +43,10 @@ def num(n):
     return "{:,}".format(int(n))
 
 
+def bcell(n):
+    return '<td data-s="%d">%s</td>' % (int(n), hb(n))
+
+
 def bar(pct):
     return "<span class=bar style='width:%d%%'></span>" % pct
 
@@ -147,17 +151,19 @@ def table(rows, win):
     top = max(r[1][0] for r in rows) or 1
     tot_by = sum(r[1][0] for r in rows)
     tot_hits = sum(r[1][1] for r in rows)
-    h = ["<div class=card><div class=tw><table><tr><th>Period</th><th>Bytes served</th>"
-         "<th>Requests</th><th>Avg per request</th><th>Share</th></tr>"]
+    h = ["<div class=\"card sortable\"><div class=tw><table><thead><tr><th>Period</th>"
+         "<th>Bytes served</th><th>Requests</th><th>Avg per request</th><th>Share</th></tr></thead>"
+         "<tbody>"]
     for k, (by, hits, nd) in rows:
         pct = int(round(by * 100.0 / top))
         share = (by * 100.0 / tot_by) if tot_by else 0
-        avg = hb(by / hits) if hits else "0 B"
-        h.append("<tr><td class=lbl>%s%s</td><td>%s</td><td>%s</td><td>%s</td><td>%.1f%%</td></tr>"
-                 % (esc(label_of(k, win)), bar(pct), hb(by), num(hits), avg, share))
-    h.append("<tr class=tot><td class=lbl>Total</td><td>%s</td><td>%s</td><td>%s</td><td>100.0%%</td></tr>"
-             % (hb(tot_by), num(tot_hits), hb(tot_by / tot_hits) if tot_hits else "0 B"))
-    h.append("</table></div></div>")
+        avg = bcell(by / hits) if hits else bcell(0)
+        h.append("<tr><td class=lbl>%s%s</td>%s<td>%s</td>%s<td>%.1f%%</td></tr>"
+                 % (esc(label_of(k, win)), bar(pct), bcell(by), num(hits), avg, share))
+    h.append("<tr class=tot><td class=lbl>Total</td>%s<td>%s</td>%s<td>100.0%%</td></tr>"
+             % (bcell(tot_by), num(tot_hits),
+                bcell(tot_by / tot_hits) if tot_hits else bcell(0)))
+    h.append("</tbody></table></div></div>")
     return "".join(h)
 
 
@@ -174,12 +180,13 @@ def by_domain_table():
         return ""
     top = rows[0][1] or 1
     tot = sum(r[1] for r in rows) or 1
-    h = ["<h2>By domain, all time</h2><div class=card><div class=tw><table>"
-         "<tr><th>Domain</th><th>Bytes served</th><th>Requests</th><th>Share</th></tr>"]
+    h = ["<h2>By domain, all time</h2><div class=\"card sortable\"><div class=tw><table><thead>"
+         "<tr><th>Domain</th><th>Bytes served</th><th>Requests</th><th>Share</th></tr></thead><tbody>"]
     for host, by, hits in rows:
-        h.append("<tr><td class=lbl>%s%s</td><td>%s</td><td>%s</td><td>%.1f%%</td></tr>"
-                 % (esc(host), bar(int(round(by * 100.0 / top))), hb(by), num(hits), by * 100.0 / tot))
-    h.append("</table></div></div>")
+        h.append("<tr><td class=lbl>%s%s</td>%s<td>%s</td><td>%.1f%%</td></tr>"
+                 % (esc(host), bar(int(round(by * 100.0 / top))), bcell(by), num(hits),
+                    by * 100.0 / tot))
+    h.append("</tbody></table></div></div>")
     return "".join(h)
 
 
@@ -235,7 +242,8 @@ btns.forEach(function(b){b.onclick=function(){show(b.getAttribute('data-view'));
 var saved='daily';try{saved=localStorage.getItem('hailsBandwidthView')||'daily';}catch(e){}
 if(V.indexOf(saved)<0)saved='daily';show(saved);})();
 </script>
-<script src="/nav.js"></script>"""
+<script src="/nav.js"></script>
+<script src="/table.js"></script>"""
 
 FAVICON = ('<link rel="icon" type="image/x-icon" href="data:image/x-icon;base64,AAABAAEAEBAQAAEABAAo'
            'AQAAFgAAACgAAAAQAAAAIAAAAAEABAAAAAAAgAAAAAAAAAAAAAAAEAAAAAAAAADGxsYAWFhYABwcHABfAP8A/9df'

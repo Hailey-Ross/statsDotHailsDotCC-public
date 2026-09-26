@@ -78,23 +78,26 @@
           var s = d.querySelector('summary');
           return { el: d, cells: Array.prototype.slice.call(s.children) };
         }),
-        pinned: [], parent: card, anchor: card, xtab: true
+        pinned: [], groups: [], all: [], parent: card, anchor: card, xtab: true
       };
     }
     var tbl = card.querySelector('table');
     if (tbl && tbl.tHead && tbl.tBodies.length) {
       var body = tbl.tBodies[0];
-      var rows = [], tot = [];
+      var rows = [], tot = [], grp = [], all = [];
       Array.prototype.forEach.call(body.rows, function (r) {
-        // The "Total (shown)" row is a summary of the rows above it, not one of them. It must never
-        // sort into the middle of the table and never be paged away.
-        (r.classList.contains('tot') ? tot : rows).push({
-          el: r, cells: Array.prototype.slice.call(r.cells)
-        });
+        all.push(r);
+        // Neither of these is data. The "Total (shown)" row summarises the rows above it, so it must
+        // never sort into the middle of the table and never be paged away. A group heading labels a
+        // run of rows and owns a single colspan cell, so letting one into the sort would scatter the
+        // headings AND make every column read undefined for them, which forces a string compare.
+        if (r.classList.contains('tot')) tot.push({ el: r, cells: Array.prototype.slice.call(r.cells) });
+        else if (r.classList.contains('grp')) grp.push(r);
+        else rows.push({ el: r, cells: Array.prototype.slice.call(r.cells) });
       });
       return {
         headers: Array.prototype.slice.call(tbl.tHead.rows[0].cells),
-        rows: rows, pinned: tot, parent: body, anchor: tbl
+        rows: rows, pinned: tot, groups: grp, all: all, parent: body, anchor: tbl
       };
     }
     return null;
@@ -198,7 +201,11 @@
       x.textContent = '×';
       x.title = 'Remove this key';
       x.onclick = function () {
-        t.chain.splice(i, 1); t.page = 1; apply(t); save(t);
+        // Removing the LAST key has to restore, not apply: apply with an empty chain never touches
+        // the DOM, so the rows would stay sorted while the headings came back over them.
+        t.chain.splice(i, 1); t.page = 1;
+        if (t.chain.length) apply(t); else restore(t);
+        save(t);
       };
       chip.appendChild(name);
       chip.appendChild(x);
@@ -220,8 +227,9 @@
     // Clearing the sort has to put the server's original ranking back, so the initial DOM order is
     // captured once at setup and replayed here rather than being re-derived from any column.
     var frag = document.createDocumentFragment();
-    t.rows.forEach(function (r) { frag.appendChild(r.el); });
-    t.parent.insertBefore(frag, insertPoint(t));
+    var seq = t.all.length ? t.all : t.rows.map(function (r) { return r.el; });
+    seq.forEach(function (el) { frag.appendChild(el); });
+    t.parent.insertBefore(frag, t.all.length ? null : insertPoint(t));
     t.order = t.rows.slice();
     markHeaders(t);
     renderChips(t);
@@ -240,6 +248,8 @@
     if (t.page > pages) t.page = pages;
     var from = (t.page - 1) * size, to = from + size;
     t.order.forEach(function (r, i) { r.el.hidden = (i < from || i >= to); });
+    // A heading only means anything while the rows it labels are still contiguous and all present.
+    t.groups.forEach(function (el) { el.hidden = !!(t.chain.length || pages > 1); });
     renderPager(t, n, pages, from, Math.min(to, n));
   }
 
