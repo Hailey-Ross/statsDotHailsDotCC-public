@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the served counter and the Performance page every 15 minutes
+
+[Timer]
+OnBootSec=4min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

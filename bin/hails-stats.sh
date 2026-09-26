@@ -201,13 +201,17 @@ if [ "$staged_ok" != 1 ]; then
 fi
 tstart
 find "$STAGE" -name '*.html' -exec chmod 644 {} +
-for t in all d; do
-  [ -d "$STAGE/$t" ] || continue
-  rm -rf "$STATS/.$t.old"
-  [ -d "$STATS/$t" ] && mv "$STATS/$t" "$STATS/.$t.old"
-  mv "$STAGE/$t" "$STATS/$t"
-  rm -rf "$STATS/.$t.old"
-done
+# hails-refresh.sh takes this lock too: between the two mv the tree does not exist.
+(
+  flock 9
+  for t in all d; do
+    [ -d "$STAGE/$t" ] || continue
+    rm -rf "$STATS/.$t.old"
+    [ -d "$STATS/$t" ] && mv "$STATS/$t" "$STATS/.$t.old"
+    mv "$STAGE/$t" "$STATS/$t"
+    rm -rf "$STATS/.$t.old"
+  done
+) 9>/var/lib/hails-stats/swap.lock
 rm -rf "$STAGE"
 tend swap
 

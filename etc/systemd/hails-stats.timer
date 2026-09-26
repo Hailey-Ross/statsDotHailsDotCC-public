@@ -1,11 +1,11 @@
 [Unit]
-Description=Regenerate GoAccess dashboard every 15 minutes
+Description=Regenerate the GoAccess dashboard and every panel page
 
 [Timer]
 OnBootSec=2min
-# The warehouse still moves every 5 minutes via hails-ingest.timer. This is only how often the HTML
-# is redrawn from it.
-OnUnitActiveSec=15min
+# The warehouse still moves every 5 minutes via hails-ingest.timer, and hails-refresh.timer redraws
+# the two fast moving pages every 15. This is only how often everything else is redrawn.
+OnUnitActiveSec=3h
 Persistent=true
 
 [Install]

@@ -195,10 +195,17 @@ your other sites down.
         v
    /var/lib/hails-stats/events.db      the durable record
         |
-        |  hails-panels.py        every 15 minutes, plus goaccess for its own dashboard
+        |  hails-panels.py        every 3 hours, plus goaccess for its own dashboard
         v
    /srv/stats/{index.html, all/, d/<domain>/}      served by Caddy behind basic auth
 ```
+
+The regen is a full rebuild of every page for every scope, and its cost tracks how much log you keep
+rather than how much traffic arrived, so it runs on a slow timer. That is not how current the data
+is: the ingest runs every 5 minutes and the panels read from the warehouse, so the regen cadence
+only decides how often current data is turned back into HTML. Two pages could not wait that long,
+the requests served counter and the Performance page, so `hails-refresh.timer` re renders just those
+two every 15 minutes from sources that are already durable and already current.
 
 The warehouse is the source and the log is the fallback. If the ingest ever stalls, the pages notice
 that the newest event has gone stale and quietly rebuild from the log for that run instead, so a

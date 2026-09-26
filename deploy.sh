@@ -25,7 +25,7 @@ say "Deploying scripts to /usr/local/bin"
 # These scripts are only correct as a set. scp copies sequentially, so a transfer that stops partway
 # leaves a mixed set on the server, which is why this step aborts rather than carrying on.
 # hails_db.py and hails_query.py are modules, imported by hails-ingest.py, so they get no chmod +x.
-scp -i "$SSH_KEY" "$HERE/bin/hails-stats.sh" "$HERE/bin/hails-stats-pre.py" "$HERE/bin/hails-geoip-refresh.sh" "$HERE/bin/hails-admin.py" "$HERE/bin/hails-panels.py" "$HERE/bin/hails-map.py" "$HERE/bin/hails-rollup.py" "$HERE/bin/hails-bandwidth.py" "$HERE/bin/hails-perf-collect.py" "$HERE/bin/hails-perf.py" "$HERE/bin/hails-served.py" "$HERE/bin/hails_db.py" "$HERE/bin/hails_query.py" "$HERE/bin/hails-ingest.py" "$HERE/bin/hails-verify.py" "$HERE/bin/hails-timing.py" "$HERE/bin/hails-diffrender.py" "$HERE/bin/hails-prune.py" "$VPS:/usr/local/bin/" || {
+scp -i "$SSH_KEY" "$HERE/bin/hails-stats.sh" "$HERE/bin/hails-refresh.sh" "$HERE/bin/hails-stats-pre.py" "$HERE/bin/hails-geoip-refresh.sh" "$HERE/bin/hails-admin.py" "$HERE/bin/hails-panels.py" "$HERE/bin/hails-map.py" "$HERE/bin/hails-rollup.py" "$HERE/bin/hails-bandwidth.py" "$HERE/bin/hails-perf-collect.py" "$HERE/bin/hails-perf.py" "$HERE/bin/hails-served.py" "$HERE/bin/hails_db.py" "$HERE/bin/hails_query.py" "$HERE/bin/hails-ingest.py" "$HERE/bin/hails-verify.py" "$HERE/bin/hails-timing.py" "$HERE/bin/hails-diffrender.py" "$HERE/bin/hails-prune.py" "$VPS:/usr/local/bin/" || {
   echo "FATAL: script transfer failed PARTWAY. scp copies sequentially, so an unknown number of the" >&2
   echo "       scripts above were already overwritten and the server now holds a MIXED set. Re run" >&2
   echo "       this deploy until it completes before letting hails-stats.timer fire again." >&2
@@ -36,7 +36,10 @@ $SSH "grep -q -- '--tally' /usr/local/bin/hails-stats-pre.py && grep -q -- '--ta
   echo "       Refusing to continue: running hails-stats.sh against this set would freeze" >&2
   echo "       /var/lib/hails-stats/bandwidth.json at today's values with no error anywhere." >&2
   exit 1; }
-$SSH "chmod +x /usr/local/bin/hails-stats.sh /usr/local/bin/hails-stats-pre.py /usr/local/bin/hails-geoip-refresh.sh /usr/local/bin/hails-admin.py /usr/local/bin/hails-panels.py /usr/local/bin/hails-map.py /usr/local/bin/hails-rollup.py /usr/local/bin/hails-bandwidth.py /usr/local/bin/hails-perf-collect.py /usr/local/bin/hails-perf.py /usr/local/bin/hails-served.py /usr/local/bin/hails-ingest.py /usr/local/bin/hails-verify.py /usr/local/bin/hails-timing.py /usr/local/bin/hails-diffrender.py /usr/local/bin/hails-prune.py; chmod 644 /usr/local/bin/hails_db.py /usr/local/bin/hails_query.py; rm -f /usr/local/bin/hails-time.py"
+$SSH "grep -q -- '--from-db' /usr/local/bin/hails-rollup.py" || {
+  echo "  WARN: the deployed hails-rollup.py does not understand --from-db. hails-refresh.service will" >&2
+  echo "        fail every 15 minutes and served.js will only advance on the 3 hourly regen." >&2; }
+$SSH "chmod +x /usr/local/bin/hails-stats.sh /usr/local/bin/hails-refresh.sh /usr/local/bin/hails-stats-pre.py /usr/local/bin/hails-geoip-refresh.sh /usr/local/bin/hails-admin.py /usr/local/bin/hails-panels.py /usr/local/bin/hails-map.py /usr/local/bin/hails-rollup.py /usr/local/bin/hails-bandwidth.py /usr/local/bin/hails-perf-collect.py /usr/local/bin/hails-perf.py /usr/local/bin/hails-served.py /usr/local/bin/hails-ingest.py /usr/local/bin/hails-verify.py /usr/local/bin/hails-timing.py /usr/local/bin/hails-diffrender.py /usr/local/bin/hails-prune.py; chmod 644 /usr/local/bin/hails_db.py /usr/local/bin/hails_query.py; rm -f /usr/local/bin/hails-time.py"
 
 say "Ensuring /etc/hails-stats/config.env (seeded once from the example, never overwritten)"
 $SSH "install -d -m 755 /etc/hails-stats"
@@ -55,10 +58,10 @@ $SSH "install -d -m 755 '$FONT_DIR'"
 scp -i "$SSH_KEY" "$HERE/assets/fonts/"* "$VPS:$FONT_DIR/"
 $SSH "chmod 644 '$FONT_DIR'/*; ls '$FONT_DIR' | tr '\n' ' '; echo"
 
-say "Deploying systemd units + timers (stats + ingest + geoip + admin + map + perf + served + verify + prune)"
-scp -i "$SSH_KEY" "$HERE/etc/systemd/hails-stats.service" "$HERE/etc/systemd/hails-stats.timer" "$HERE/etc/systemd/hails-ingest.service" "$HERE/etc/systemd/hails-ingest.timer" "$HERE/etc/systemd/hails-geoip.service" "$HERE/etc/systemd/hails-geoip.timer" "$HERE/etc/systemd/hails-admin.service" "$HERE/etc/systemd/hails-map.service" "$HERE/etc/systemd/hails-map.timer" "$HERE/etc/systemd/hails-perf.service" "$HERE/etc/systemd/hails-served.service" "$HERE/etc/systemd/hails-verify.service" "$HERE/etc/systemd/hails-verify.timer" "$HERE/etc/systemd/hails-prune.service" "$HERE/etc/systemd/hails-prune.timer" "$VPS:/etc/systemd/system/"
+say "Deploying systemd units + timers (stats + refresh + ingest + geoip + admin + map + perf + served + verify + prune)"
+scp -i "$SSH_KEY" "$HERE/etc/systemd/hails-stats.service" "$HERE/etc/systemd/hails-stats.timer" "$HERE/etc/systemd/hails-refresh.service" "$HERE/etc/systemd/hails-refresh.timer" "$HERE/etc/systemd/hails-ingest.service" "$HERE/etc/systemd/hails-ingest.timer" "$HERE/etc/systemd/hails-geoip.service" "$HERE/etc/systemd/hails-geoip.timer" "$HERE/etc/systemd/hails-admin.service" "$HERE/etc/systemd/hails-map.service" "$HERE/etc/systemd/hails-map.timer" "$HERE/etc/systemd/hails-perf.service" "$HERE/etc/systemd/hails-served.service" "$HERE/etc/systemd/hails-verify.service" "$HERE/etc/systemd/hails-verify.timer" "$HERE/etc/systemd/hails-prune.service" "$HERE/etc/systemd/hails-prune.timer" "$VPS:/etc/systemd/system/"
 # hails-perf is resident rather than timer driven, so it is restarted to pick up a changed collector.
-$SSH "systemctl daemon-reload && systemctl enable --now hails-stats.timer hails-ingest.timer hails-geoip.timer hails-map.timer hails-verify.timer hails-prune.timer >/dev/null 2>&1; systemctl enable --now hails-admin.service >/dev/null 2>&1; systemctl enable hails-perf.service >/dev/null 2>&1; systemctl restart hails-perf.service >/dev/null 2>&1; echo stats-timer: \$(systemctl is-active hails-stats.timer) ingest-timer: \$(systemctl is-active hails-ingest.timer) geoip-timer: \$(systemctl is-active hails-geoip.timer) map-timer: \$(systemctl is-active hails-map.timer) verify-timer: \$(systemctl is-active hails-verify.timer) admin: \$(systemctl is-active hails-admin.service) perf: \$(systemctl is-active hails-perf.service)"
+$SSH "systemctl daemon-reload && systemctl enable --now hails-stats.timer hails-refresh.timer hails-ingest.timer hails-geoip.timer hails-map.timer hails-verify.timer hails-prune.timer >/dev/null 2>&1; systemctl enable --now hails-admin.service >/dev/null 2>&1; systemctl enable hails-perf.service >/dev/null 2>&1; systemctl restart hails-perf.service >/dev/null 2>&1; echo stats-timer: \$(systemctl is-active hails-stats.timer) refresh-timer: \$(systemctl is-active hails-refresh.timer) ingest-timer: \$(systemctl is-active hails-ingest.timer) geoip-timer: \$(systemctl is-active hails-geoip.timer) map-timer: \$(systemctl is-active hails-map.timer) verify-timer: \$(systemctl is-active hails-verify.timer) admin: \$(systemctl is-active hails-admin.service) perf: \$(systemctl is-active hails-perf.service)"
 
 say "Ensuring the isolated stats auth import + admins file (seeded once, never overwritten)"
 # The login lives in its own file so the Settings page can edit users without touching the Caddyfile.
@@ -101,6 +104,12 @@ grep -q "127.0.0.1:8770" $C && echo "  OK  /admin route present" || echo "  MISS
 
 say "Rebuilding the dashboard now"
 $SSH "chown -R caddy:caddy /var/log/caddy; systemctl start hails-stats.service; echo pages: \$(find /srv/stats -name '*.html' | wc -l)"
+
+say "Running the fast tick once"
+$SSH "systemctl start hails-refresh.service; R=\$(systemctl show -p Result --value hails-refresh.service); echo refresh: \$R; [ \"\$R\" = success ]" || {
+  echo "FATAL: hails-refresh.service did not complete cleanly. served.js and perf.html will only be" >&2
+  echo "       refreshed by the 3 hourly regen until fixed. journalctl -u hails-refresh.service -n 50" >&2
+  exit 1; }
 
 say "Building the network map + sitemaps now"
 $SSH "systemctl start hails-map.service; echo map: \$(test -f /srv/stats/map.html && echo written || echo MISSING); echo sitemaps: \$(ls /srv/*/sitemap.xml 2>/dev/null | wc -l)"

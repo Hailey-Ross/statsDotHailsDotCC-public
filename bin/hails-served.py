@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Totals the hits in the bandwidth rollup and writes "Over N requests served" into served.js for any
-# public page to load. Run from hails-stats.sh once per regen, after the rollup has been merged.
+# public page to load. Run after the rollup has been merged, by hails-stats.sh on each regen and by
+# hails-refresh.sh in between.
 # With HAILS_SERVED_ROOT unset it writes nothing at all.
 import os, json, sys
 
@@ -73,7 +74,12 @@ try:
         fh.write(body)
     os.chmod(tmp, 0o644)
     os.replace(tmp, OUT)
-except Exception:
-    sys.exit(0)
+except Exception as e:
+    sys.stderr.write("hails-served: could not write %s: %s\n" % (OUT, e))
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    sys.exit(1)
 
 print(text)

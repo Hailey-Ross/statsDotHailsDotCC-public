@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh the served counter and the Performance page between dashboard regens
+
+[Service]
+EnvironmentFile=-/etc/hails-stats/config.env
+Type=oneshot
+ExecStart=/usr/local/bin/hails-refresh.sh
+Nice=10
+IOSchedulingClass=idle
