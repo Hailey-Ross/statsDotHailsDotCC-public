@@ -118,7 +118,6 @@ def run(cmd, timeout=120):
 
 
 def caddy_reload(prev_auth):
-    # Rolls the auth file back if validation fails.
     v = run(["caddy", "validate", "--config", CADDYFILE, "--adapter", "caddyfile"])
     if v.returncode != 0:
         with open(AUTH_FILE, "w") as f:
